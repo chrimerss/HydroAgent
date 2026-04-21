@@ -1,0 +1,12 @@
+name: qwen2.5-72b
+model_id: "Qwen/Qwen2.5-72B-Instruct"
+lora_r: 8
+lora_alpha: 16
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+learning_rate: 1.0e-6
+grad_accum_steps: 16
+gpu_mode: server

@@ -1,0 +1,30 @@
+# Shared GRPO training hyperparameters
+# Used by all model configs
+
+# GRPO core
+num_generations: 8          # K rollouts per prompt
+max_completion_length: 2048 # Multi-turn needs more tokens
+kl_coef: 0.05              # KL divergence penalty coefficient
+num_train_epochs: 30        # Training epochs
+
+# Multi-turn
+max_turns: 10               # Max calibration rounds per rollout
+
+# Environment
+ef5_timeout: 120            # Seconds per EF5 simulation run
+
+# Logging
+report_to: wandb
+logging_steps: 1
+save_steps: 50
+
+# Phase 1: single gage
+gage_configs:
+  - configs/gages/02338660.yaml
+
+# Phase 2: uncomment to scale to 20 CONUS gages
+# gage_configs:
+#   - configs/gages/02338660.yaml
+#   - configs/gages/01632000.yaml
+#   - configs/gages/03364000.yaml
+#   ... (add more)
