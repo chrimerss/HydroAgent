@@ -26,17 +26,26 @@ Most LLM agents cannot reliably calibrate hydrologic models. They lack the domai
 
 Each training step generates **K=8 rollouts** (multi-turn calibration trajectories). GRPO compares them by relative reward and updates the policy — no critic model needed.
 
-## Models
+## Model
 
-All models use the Qwen2.5-Instruct family with LoRA adapters:
+Training uses **Qwen3-8B** with LoRA adapters in BF16 precision on a single H100 GPU:
 
-| Model | GPU Config | Use Case |
-|-------|-----------|----------|
-| Qwen2.5-7B-Instruct | 1–2 GPU (colocate) | Fast iteration, debugging |
-| Qwen2.5-32B-Instruct | 4 GPU (server mode) | Strong mid-scale |
-| Qwen2.5-72B-Instruct | 8 GPU (server + FSDP) | Maximum reasoning |
+| Setting | Value |
+|---------|-------|
+| Base model | `Qwen/Qwen3-8B` |
+| Precision | BF16 (no quantization) |
+| LoRA rank | 16 (α=32) |
+| GPU | 1×H100 (80 GB) |
+| Attention | PyTorch SDPA |
+| Training stack | PEFT + TRL GRPOTrainer |
 
-Training uses **Unsloth** for ~90% VRAM reduction over standard TRL, making 72B feasible on 8×H100.
+**Why Qwen3?** Qwen3's dual-mode reasoning (thinking + non-thinking) and improved tool-calling are well-suited for iterative hydrologic calibration, where the model must reason about parameter adjustments based on hydrograph errors.
+
+**Why not Unsloth/vLLM?** Both have compatibility issues with the current PyTorch/CUDA stack:
+- Unsloth's compiled GRPO trainer has a chunked log-softmax bug (shape mismatch in `torch.gather`)
+- vLLM's torch.compile has a SymInt bug with bitsandbytes quantization
+
+The standard PEFT + TRL stack is more stable and 8B in BF16 (~16 GB) fits comfortably on a single H100 with room for LoRA gradients and optimizer states.
 
 ## Project Structure
 
@@ -65,9 +74,8 @@ HydroLLM/
 │
 ├── configs/
 │   ├── models/                 # Per-model training configs
-│   │   ├── qwen2.5_7b.yaml
-│   │   ├── qwen2.5_32b.yaml
-│   │   └── qwen2.5_72b.yaml
+│   │   ├── qwen3_8b.yaml       # Primary (Qwen3-8B)
+│   │   └── qwen2.5_7b.yaml    # Legacy (Qwen2.5-7B)
 │   ├── gages/                  # Per-gage watershed configs
 │   │   └── 02338660.yaml
 │   └── train_config.yaml       # Shared GRPO hyperparameters
@@ -107,38 +115,26 @@ modal secret create huggingface HF_TOKEN=your_hf_token
 
 ### 3. Run Baseline Evaluation (Phase 0)
 
-Evaluate the base Qwen2.5 models _before_ any training to establish the performance floor:
+Evaluate the base Qwen3 model _before_ any training to establish the performance floor:
 
 ```bash
-# Single model
 modal run modal_app/baseline.py \
-    --model-config configs/models/qwen2.5_7b.yaml
-
-# All 3 models
-modal run modal_app/baseline.py --all
+    --model-config configs/models/qwen3_8b.yaml
 ```
 
 Results are saved to the `hydrollm-results` Modal Volume.
 
 ### 4. Train with GRPO (Phase 1)
 
-Start with the 7B model for fast iteration:
-
 ```bash
-modal run modal_app/train.py \
-    --model-config configs/models/qwen2.5_7b.yaml
+modal run modal_app/train.py
 ```
 
-Scale up after validating the pipeline:
+Or explicitly specify the model config:
 
 ```bash
-# 32B model
 modal run modal_app/train.py \
-    --model-config configs/models/qwen2.5_32b.yaml
-
-# 72B model (requires 8×H100)
-modal run modal_app/train.py \
-    --model-config configs/models/qwen2.5_72b.yaml
+    --model-config configs/models/qwen3_8b.yaml
 ```
 
 Monitor training on [W&B](https://wandb.ai) — look for increasing mean reward (NSE) and bounded KL divergence.
@@ -147,15 +143,15 @@ Monitor training on [W&B](https://wandb.ai) — look for increasing mean reward 
 
 ```bash
 modal run modal_app/eval.py \
-    --model-path /checkpoints/qwen2.5-7b/final
+    --model-path /checkpoints/qwen3-8b/final
 ```
 
 ### 6. Push to HuggingFace
 
 ```bash
 python scripts/push_model.py \
-    --model-path /checkpoints/qwen2.5-7b/final \
-    --repo-id your-username/hydrollm-qwen2.5-7b
+    --model-path /checkpoints/qwen3-8b/final \
+    --repo-id your-username/hydrollm-qwen3-8b
 ```
 
 ## Local Development
@@ -189,15 +185,14 @@ docker run hydrollm-test python3 scripts/test_env_local.py
 | `max_turns` | 10 | Max calibration rounds per rollout |
 | `ef5_timeout` | 120 | Seconds per EF5 simulation |
 
-### Model Configs (`configs/models/*.yaml`)
+### Model Config (`configs/models/qwen3_8b.yaml`)
 
-| Parameter | 7B | 32B | 72B |
-|-----------|----|-----|-----|
-| `lora_r` | 16 | 16 | 8 |
-| `lora_alpha` | 32 | 32 | 16 |
-| `learning_rate` | 5e-6 | 2e-6 | 1e-6 |
-| `grad_accum_steps` | 4 | 8 | 16 |
-| `gpu_mode` | colocate | server | server |
+| Parameter | Value |
+|-----------|-------|
+| `lora_r` | 16 |
+| `lora_alpha` | 32 |
+| `learning_rate` | 5e-6 |
+| `gpu_mode` | colocate |
 
 ### Adding New Gages (Phase 2)
 
@@ -244,6 +239,26 @@ The model has access to three tools during calibration:
 | `set_parameters` | Set 11 tunable CREST parameter multipliers (wm, b, im, ke, fc, under, leaki, alpha, beta, alpha0, iwu) |
 | `run_simulation` | Execute EF5 and return NSE, peak flows, volume ratio, timing error |
 | `evaluate` | Get calibration progress: NSE history, best NSE, target status |
+
+## Technical Notes
+
+### Known Compatibility Issues
+
+- **Unsloth GRPO bug**: Unsloth's compiled `chunked_hidden_states_selective_log_softmax` has a dimension mismatch (index 32 tokens longer than logits). Affects all models. Workaround: use standard TRL GRPOTrainer.
+- **vLLM + bitsandbytes**: vLLM's torch.compile produces `SymInt` errors when the model uses bitsandbytes 4-bit quantization. Workaround: use BF16 precision, disable vLLM for rollouts.
+- **vLLM V1 engine**: `VLLM_USE_V1=0` env var is not reliably respected. Both V0 and V1 trigger the SymInt crash.
+- **flash-attn**: Requires CUDA SDK (`CUDA_HOME`) installed in the container. Modal's base pytorch images don't include it. Workaround: use PyTorch's built-in SDPA (`attn_implementation="sdpa"`).
+
+### Memory Budget (1×H100, 80 GB)
+
+| Component | Estimate |
+|-----------|----------|
+| Qwen3-8B BF16 weights | ~16 GB |
+| LoRA adapters | ~0.1 GB |
+| Optimizer states (AdamW) | ~0.4 GB |
+| Activations (gradient checkpointing) | ~8 GB |
+| KV cache (8 rollouts × 2048 tokens) | ~12 GB |
+| **Headroom** | **~43 GB** |
 
 ## Roadmap
 

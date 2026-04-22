@@ -1,0 +1,22 @@
+# Qwen3-8B model configuration for HydroLLM GRPO training
+name: "qwen3-8b"
+model_id: "Qwen/Qwen3-8B"
+
+# LoRA configuration
+lora_r: 16
+lora_alpha: 32
+lora_target_modules:
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  - "gate_proj"
+  - "up_proj"
+  - "down_proj"
+
+# Training
+learning_rate: 5.0e-6
+grad_accum_steps: 4
+
+# GPU mode (colocate = model + vLLM on same GPUs)
+gpu_mode: "colocate"

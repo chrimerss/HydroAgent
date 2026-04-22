@@ -30,8 +30,8 @@ def run_baseline(
     """Run a base model on hydrologic calibration without any RL training.
 
     This function:
-    1. Loads the model via vLLM
-    2. Constructs a multi-turn conversation with tool definitions
+    1. Loads the model via vLLM (offline mode)
+    2. Uses the tokenizer's chat template to inject tool definitions
     3. Executes the conversation loop (model generates → tools execute → repeat)
     4. Records all metrics for baseline analysis
 
@@ -46,27 +46,28 @@ def run_baseline(
         Dict with baseline results including NSE, trajectories, and metrics.
     """
     from vllm import LLM, SamplingParams
+    from transformers import AutoTokenizer
 
     logger.info("Loading model %s for baseline evaluation...", model_name)
+
+    # Load tokenizer separately to apply chat template with tools
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
     llm = LLM(
         model=model_name,
         trust_remote_code=True,
         max_model_len=8192,
-        enable_auto_tool_choice=True,
-        tool_call_parser="hermes",
     )
     sampling_params = SamplingParams(
         temperature=temperature,
         max_tokens=max_tokens,
+        stop=["<|im_end|>"],  # Qwen2.5 end-of-turn token
     )
 
     # Initialize environment and conversation
     env = HydroEnvironment(gage_config)
     executor = ToolExecutor(env)
     messages = build_messages(gage_config)
-
-    # Add tool definitions to the first message for models that use them
-    tool_defs = json.dumps(HYDRO_TOOLS, indent=2)
 
     parameter_trajectory = []
     valid_tool_calls = 0
@@ -78,16 +79,18 @@ def run_baseline(
         for turn in range(max_turns):
             logger.info("Turn %d/%d", turn + 1, max_turns)
 
-            # Generate model response
-            # Note: vLLM chat interface handles tool-calling format
-            outputs = llm.chat(
-                messages=messages,
-                sampling_params=sampling_params,
+            # Apply chat template with tool definitions
+            # Qwen2.5-Instruct tokenizers support `tools` in apply_chat_template
+            prompt = tokenizer.apply_chat_template(
+                messages,
                 tools=HYDRO_TOOLS,
+                tokenize=False,
+                add_generation_prompt=True,
             )
 
-            response = outputs[0]
-            assistant_message = response.outputs[0].text
+            # Generate model response using offline LLM API
+            outputs = llm.generate(prompt, sampling_params)
+            assistant_message = outputs[0].outputs[0].text
 
             # Add assistant response to conversation
             messages.append({"role": "assistant", "content": assistant_message})

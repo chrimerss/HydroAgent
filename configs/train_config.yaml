@@ -3,7 +3,7 @@
 
 # GRPO core
 num_generations: 8          # K rollouts per prompt
-max_completion_length: 2048 # Multi-turn needs more tokens
+max_completion_length: 2048 # Multi-turn tool calling
 kl_coef: 0.05              # KL divergence penalty coefficient
 num_train_epochs: 30        # Training epochs
 

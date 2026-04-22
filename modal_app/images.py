@@ -53,18 +53,21 @@ train_image = (
     .env({
         "EF5_EXECUTABLE": "/EF5/bin/ef5",
         "PATH": "/EF5/bin:$PATH",
+        "VLLM_USE_V1": "0",
+        "TORCH_COMPILE_DISABLE": "1",  # Prevents SymInt crash in vLLM model loading
     })
     # ----- Python training stack -----
-    .uv_pip_install(
-        # Core training
-        "unsloth",
+    # Stage 1: PyTorch (pins CUDA/nvidia library versions)
+    .pip_install(
+        "torch>=2.4",
+    )
+    # Stage 2: Training stack
+    .pip_install(
         "trl>=1.0",
         "transformers>=4.45",
-        "vllm>=0.6",
         "accelerate",
         "peft",
         "datasets",
-        "torch>=2.4",
         # Scientific computing (pinned for EF5 compatibility)
         "numpy==1.26.4",
         "pandas==2.2.2",
@@ -75,7 +78,8 @@ train_image = (
         "jmespath",
     )
     # ----- Add project source code -----
-    .add_local_python_source("src")
+    .add_local_dir("src/hydrollm", remote_path="/root/hydrollm")
+    .add_local_dir("modal_app", remote_path="/root/modal_app")
     .add_local_file("control.txt", "/app/data/docs/control.txt")
     .add_local_dir("configs", "/app/configs")
 )
@@ -112,6 +116,7 @@ eval_image = (
     .env({
         "EF5_EXECUTABLE": "/EF5/bin/ef5",
         "PATH": "/EF5/bin:$PATH",
+        "VLLM_USE_V1": "0",  # V1 engine has torch.compile SymInt bug with Qwen2
     })
     .uv_pip_install(
         "vllm>=0.6",
@@ -122,7 +127,8 @@ eval_image = (
         "scipy==1.13.1",
         "pyyaml",
     )
-    .add_local_python_source("src")
+    .add_local_dir("src/hydrollm", remote_path="/root/hydrollm")
+    .add_local_dir("modal_app", remote_path="/root/modal_app")
     .add_local_file("control.txt", "/app/data/docs/control.txt")
     .add_local_dir("configs", "/app/configs")
 )

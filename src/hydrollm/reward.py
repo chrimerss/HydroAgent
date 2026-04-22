@@ -136,12 +136,25 @@ def make_online_reward(gage_config: GageConfig):
         trainer = GRPOTrainer(reward_funcs=[reward_fn], ...)
     """
 
-    def online_reward(completions: list[str], **kwargs: Any) -> list[float]:
+    def online_reward(completions: list, **kwargs: Any) -> list[float]:
         rewards = []
         for completion in completions:
+            # TRL may pass completions as:
+            #   - a string (plain text)
+            #   - a list of message dicts (chat format: [{"role": ..., "content": ...}])
+            if isinstance(completion, list):
+                # Chat format: concatenate all content fields
+                text = "\n".join(
+                    msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                    for msg in completion
+                    if (isinstance(msg, dict) and msg.get("content")) or not isinstance(msg, dict)
+                )
+            else:
+                text = str(completion)
+
             env = HydroEnvironment(gage_config)
             try:
-                tool_calls = parse_tool_calls(completion)
+                tool_calls = parse_tool_calls(text)
                 if not tool_calls:
                     rewards.append(-1.0)
                     continue
