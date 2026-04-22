@@ -1,8 +1,11 @@
 # HydroLLM
 
-**Reinforcement learning fine-tuning of LLMs with hydrologic simulation feedback.**
+**SFT + RL fine-tuning of LLMs for hydrologic model calibration.**
 
-HydroLLM trains open-source tool-calling language models to calibrate the EF5/CREST distributed hydrologic model using GRPO (Group Relative Policy Optimization). The reward signal comes directly from Nash-Sutcliffe Efficiency (NSE) scores computed after running real hydrologic simulations — no human feedback required.
+HydroLLM trains open-source tool-calling language models to calibrate the EF5/CREST distributed hydrologic model via a two-stage pipeline:
+
+1. **SFT (Supervised Fine-Tuning)**: Distill GPT-4o calibration expertise into Qwen3-8B using 2,500+ multi-turn trajectories across 29 USGS gages → [`Qwen-3-8B-hydro-distill`](https://huggingface.co/chrimerss/Qwen-3-8B-hydro-distill)
+2. **RL (GRPO)**: Reinforce with online EF5 simulation feedback on target gages → [`Qwen-3-8B-hydroLLM`](https://huggingface.co/chrimerss/Qwen-3-8B-hydroLLM)
 
 ## Motivation
 
@@ -11,20 +14,22 @@ Most LLM agents cannot reliably calibrate hydrologic models. They lack the domai
 ## How It Works
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    GRPO Training Loop                   │
-│                                                         │
-│  1. Model receives gage info + parameter ranges         │
-│  2. Model reasons about watershed → calls set_params()  │
-│  3. EF5/CREST runs simulation → returns hydrograph      │
-│  4. Model analyzes errors → adjusts parameters          │
-│  5. Repeat for N turns                                  │
-│  6. Best NSE across turns → trajectory reward           │
-│  7. GRPO updates weights using group-relative advantage │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│             Three-Phase Training Pipeline                   │
+│                                                             │
+│  Phase 0: Base LLM (Qwen3-8B) — baseline performance       │
+│                      ↓                                      │
+│  Phase 1: SFT — distill GPT-4o calibration trajectories     │
+│           2,576 examples × 29 gages × quality-weighted      │
+│           → Qwen-3-8B-hydro-distill                         │
+│                      ↓                                      │
+│  Phase 2: RL (GRPO) — online EF5 simulation feedback        │
+│           K=8 rollouts per prompt, NSE reward signal         │
+│           → Qwen-3-8B-hydroLLM                              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-Each training step generates **K=8 rollouts** (multi-turn calibration trajectories). GRPO compares them by relative reward and updates the policy — no critic model needed.
+The SFT stage teaches the model calibration reasoning and tool usage from 73 expert trajectories across diverse US watersheds. The RL stage then refines this with real EF5 simulation feedback.
 
 ## Model
 
@@ -62,27 +67,36 @@ HydroLLM/
 │   ├── environment.py          # Thread-safe EF5 simulation sandbox
 │   ├── tools.py                # Tool definitions + executor + parser
 │   ├── reward.py               # Trajectory-level NSE reward function
-│   ├── dataset.py              # Multi-gage HF dataset builder
+│   ├── dataset.py              # Multi-gage HF dataset builder (GRPO)
+│   ├── sft_dataset.py          # SFT dataset loader
 │   ├── prompts.py              # System/user prompt templates
 │   └── baseline.py             # Base model inference evaluator
 │
 ├── modal_app/                  # Modal serverless deployment
 │   ├── images.py               # Modal image definitions
+│   ├── sft.py                  # SFT training entrypoint
 │   ├── train.py                # GRPO training entrypoint
-│   ├── baseline.py             # Baseline evaluation entrypoint
-│   └── eval.py                 # Post-training evaluation
+│   └── eval.py                 # Unified inference evaluation
 │
 ├── configs/
+│   ├── sft_config.yaml         # SFT hyperparameters
+│   ├── train_config.yaml       # Shared GRPO hyperparameters
 │   ├── models/                 # Per-model training configs
-│   │   ├── qwen3_8b.yaml       # Primary (Qwen3-8B)
-│   │   └── qwen2.5_7b.yaml    # Legacy (Qwen2.5-7B)
-│   ├── gages/                  # Per-gage watershed configs
-│   │   └── 02338660.yaml
-│   └── train_config.yaml       # Shared GRPO hyperparameters
+│   │   ├── qwen3_8b.yaml       # Base model (Qwen3-8B)
+│   │   ├── qwen3_8b_sft.yaml   # SFT distillation config
+│   │   └── qwen3_8b_rl.yaml    # RL config (starts from SFT)
+│   └── gages/                  # Per-gage watershed configs
+│       └── 02338660.yaml
+│
+├── data/                       # Generated training data
+│   └── sft_train.jsonl         # SFT conversations (2,576 examples)
+│
+├── sets_for_SFT_RL/            # Raw GPT-4o calibration histories
+│                               # (73 experiments × 29 gages)
 │
 ├── scripts/                    # Utility scripts
+│   ├── prepare_sft_data.py     # Convert calibration histories → JSONL
 │   ├── test_env_local.py       # Environment sanity check
-│   ├── run_baseline.sh         # Run all baselines
 │   └── push_model.py           # Push model to HuggingFace
 │
 └── tests/                      # Unit tests (46 tests)
@@ -118,41 +132,58 @@ modal secret create huggingface HF_TOKEN=your_hf_token
 Evaluate the base Qwen3 model _before_ any training to establish the performance floor:
 
 ```bash
-modal run modal_app/baseline.py \
-    --model-config configs/models/qwen3_8b.yaml
+modal run modal_app/eval.py --model-id Qwen/Qwen3-8B
 ```
 
 Results are saved to the `hydrollm-results` Modal Volume.
 
-### 4. Train with GRPO (Phase 1)
+### 4. Prepare SFT Data
+
+Convert GPT-4o calibration histories to multi-turn chat format:
 
 ```bash
-modal run modal_app/train.py
+python scripts/prepare_sft_data.py
 ```
 
-Or explicitly specify the model config:
+This processes 73 calibration experiments across 29 gages and outputs `data/sft_train.jsonl` (2,576 quality-weighted examples).
+
+### 5. SFT Training (Phase 1)
+
+Distill GPT-4o calibration expertise into Qwen3-8B:
+
+```bash
+modal run modal_app/sft.py
+```
+
+The SFT model is automatically pushed to [`chrimerss/Qwen-3-8B-hydro-distill`](https://huggingface.co/chrimerss/Qwen-3-8B-hydro-distill).
+
+### 6. GRPO RL Training (Phase 2)
+
+Reinforce the SFT model with online EF5 simulation feedback:
 
 ```bash
 modal run modal_app/train.py \
-    --model-config configs/models/qwen3_8b.yaml
+    --model-config configs/models/qwen3_8b_rl.yaml
 ```
+
+The RL model is automatically pushed to [`chrimerss/Qwen-3-8B-hydroLLM`](https://huggingface.co/chrimerss/Qwen-3-8B-hydroLLM).
 
 Monitor training on [W&B](https://wandb.ai) — look for increasing mean reward (NSE) and bounded KL divergence.
 
-### 5. Evaluate Trained Model
+### 7. Evaluate All Models
 
 ```bash
-modal run modal_app/eval.py \
-    --model-path /checkpoints/qwen3-8b/final
+# Baseline (raw Qwen3-8B)
+modal run modal_app/eval.py --model-id Qwen/Qwen3-8B
+
+# Experiment: SFT model
+modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydro-distill
+
+# Experiment: RL model
+modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydroLLM
 ```
 
-### 6. Push to HuggingFace
-
-```bash
-python scripts/push_model.py \
-    --model-path /checkpoints/qwen3-8b/final \
-    --repo-id your-username/hydrollm-qwen3-8b
-```
+Results are tagged as `baseline` or `experiment` and saved to the `hydrollm-results` Modal Volume.
 
 ## Local Development
 
@@ -263,9 +294,10 @@ The model has access to three tools during calibration:
 ## Roadmap
 
 - [x] **Phase 0**: Baseline evaluation infrastructure
-- [x] **Phase 1**: Multi-turn GRPO on single gage (02338660)
-- [ ] **Phase 2**: Scale to 20 CONUS gages
-- [ ] **Phase 3**: Paper & model release on HuggingFace
+- [x] **Phase 1**: SFT distillation from GPT-4o calibration trajectories (29 gages)
+- [x] **Phase 2**: GRPO RL on single gage (02338660)
+- [ ] **Phase 3**: Scale RL to 20+ CONUS gages
+- [ ] **Phase 4**: Paper & model release on HuggingFace
 
 ## Citation
 

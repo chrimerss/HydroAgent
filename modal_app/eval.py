@@ -1,85 +1,266 @@
-"""Modal entrypoint for evaluating trained HydroLLM models.
+"""Modal entrypoint for HydroLLM inference evaluation.
 
-Compares trained models against base models on calibration tasks.
+Unified inference script: pass any model ID and the script determines
+whether it's a baseline (base Qwen3-8B) or experiment (SFT/RL fine-tuned).
 
 Usage:
-    modal run modal_app/eval.py --model-path /checkpoints/qwen2.5-7b/final
-    modal run modal_app/eval.py --model-path /checkpoints/qwen2.5-72b/final
+    # Baseline — raw Qwen3-8B
+    modal run modal_app/eval.py --model-id Qwen/Qwen3-8B
+
+    # Experiment — SFT distilled model
+    modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydro-distill
+
+    # Experiment — RL fine-tuned model
+    modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydroLLM
+
+    # Custom gage + turns
+    modal run modal_app/eval.py --model-id Qwen/Qwen3-8B \
+        --gage-config configs/gages/02338660.yaml --max-turns 15
 """
 
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
 import modal
 
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from modal_app.images import eval_image
 
 app = modal.App("hydrollm-eval")
-checkpoint_vol = modal.Volume.from_name("hydrollm-checkpoints")
+
 results_vol = modal.Volume.from_name("hydrollm-results", create_if_missing=True)
+checkpoints_vol = modal.Volume.from_name("hydrollm-checkpoints", create_if_missing=True)
+
+# Models treated as "baseline" (no fine-tuning applied)
+BASELINE_MODELS = {
+    "Qwen/Qwen3-8B",
+}
+
+
+def classify_model(model_id: str) -> str:
+    """Classify a model as 'baseline' or 'experiment'."""
+    if model_id in BASELINE_MODELS:
+        return "baseline"
+    return "experiment"
 
 
 @app.function(
     image=eval_image,
-    gpu="H100:2",
-    timeout=7200,
+    gpu="H100:1",
+    timeout=7200,  # 2 hours
     volumes={
-        "/checkpoints": checkpoint_vol,
         "/results": results_vol,
+        "/checkpoints": checkpoints_vol,
     },
     secrets=[modal.Secret.from_name("huggingface")],
     memory=65536,
 )
-def evaluate_model(
-    model_path: str,
+def run_inference(
+    model_id: str = "Qwen/Qwen3-8B",
     gage_config: str = "configs/gages/02338660.yaml",
-    max_turns: int = 10,
+    max_turns: int = 100,
+    temperature: float = 0.7,
+    max_tokens: int = 2048,
 ):
-    """Evaluate a trained model on a calibration task.
+    """Run model inference on a calibration task.
+
+    Automatically classifies the model as baseline or experiment
+    based on the model ID and saves results accordingly.
 
     Args:
-        model_path: Path to trained model checkpoint (on Modal Volume).
+        model_id: HuggingFace model ID (base or fine-tuned).
         gage_config: Path to gage YAML config.
         max_turns: Maximum calibration turns.
+        temperature: Sampling temperature for generation.
+        max_tokens: Maximum tokens per generation.
     """
     import logging
+    import time
+
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("hydrollm.eval")
 
+    from transformers import AutoTokenizer
+    from vllm import LLM, SamplingParams
+
     from hydrollm.config import load_gage_config
-    from hydrollm.baseline import run_baseline
+    from hydrollm.environment import HydroEnvironment
+    from hydrollm.prompts import build_messages
+    from hydrollm.tools import HYDRO_TOOLS, ToolExecutor, parse_tool_calls
+
+    # Classify model
+    run_type = classify_model(model_id)
+    model_short = model_id.split("/")[-1]
 
     gcfg = load_gage_config(f"/app/{gage_config}")
 
-    logger.info("Evaluating trained model: %s", model_path)
-    result = run_baseline(
-        model_name=model_path,
-        gage_config=gcfg,
-        max_turns=max_turns,
+    logger.info("=" * 60)
+    logger.info("HydroLLM Inference Evaluation")
+    logger.info("Model:     %s", model_id)
+    logger.info("Run type:  %s", run_type.upper())
+    logger.info("Gage:      %s", gcfg.gage_id)
+    logger.info("Max turns: %d", max_turns)
+    logger.info("=" * 60)
+
+    # Load tokenizer + model
+    logger.info("Loading model %s ...", model_id)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        extra_special_tokens={},  # Workaround for Qwen tokenizer save bug (list vs dict)
     )
 
+    llm = LLM(
+        model=model_id,
+        trust_remote_code=True,
+        max_model_len=8192,
+    )
+    sampling_params = SamplingParams(
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stop=["<|im_end|>"],
+    )
+
+    # Initialize environment and conversation
+    env = HydroEnvironment(gcfg)
+    executor = ToolExecutor(env)
+    messages = build_messages(gcfg)
+
+    parameter_trajectory = []
+    valid_tool_calls = 0
+    invalid_tool_calls = 0
+    turn_details = []
+    start_time = time.time()
+
+    try:
+        for turn in range(max_turns):
+            logger.info("Turn %d/%d", turn + 1, max_turns)
+
+            # Apply chat template with tool definitions
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tools=HYDRO_TOOLS,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+            # Generate
+            outputs = llm.generate(prompt, sampling_params)
+            assistant_message = outputs[0].outputs[0].text
+
+            messages.append({"role": "assistant", "content": assistant_message})
+
+            # Parse tool calls
+            tool_calls = parse_tool_calls(assistant_message)
+
+            if not tool_calls:
+                logger.info("No tool calls in turn %d, ending conversation", turn + 1)
+                turn_details.append({
+                    "turn": turn + 1,
+                    "action": "no_tool_call",
+                    "response_preview": assistant_message[:200],
+                })
+                break
+
+            # Execute each tool call
+            for call in tool_calls:
+                tool_name = call["name"]
+                tool_args = call["arguments"]
+
+                logger.info("Executing tool: %s", tool_name)
+                result_str = executor.execute(tool_name, tool_args)
+
+                result_data = json.loads(result_str)
+                if result_data.get("status") == "error":
+                    invalid_tool_calls += 1
+                else:
+                    valid_tool_calls += 1
+
+                if tool_name == "set_parameters" and result_data.get("status") == "ok":
+                    parameter_trajectory.append(result_data.get("validated_params", {}))
+
+                messages.append({
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": result_str,
+                })
+
+                turn_details.append({
+                    "turn": turn + 1,
+                    "tool": tool_name,
+                    "nse": result_data.get("nse"),
+                })
+
+    finally:
+        elapsed = time.time() - start_time
+        eval_result = env.evaluate()
+        env.cleanup()
+
+    result = {
+        "model": model_id,
+        "run_type": run_type,
+        "gage_id": gcfg.gage_id,
+        "final_nse": eval_result["current_nse"],
+        "best_nse": eval_result["best_nse"],
+        "nse_history": eval_result["nse_history"],
+        "num_turns": len(turn_details),
+        "num_simulation_runs": eval_result["num_runs"],
+        "valid_tool_calls": valid_tool_calls,
+        "invalid_tool_calls": invalid_tool_calls,
+        "parameter_trajectory": parameter_trajectory,
+        "target_nse": gcfg.target_nse,
+        "target_met": eval_result["target_met"],
+        "elapsed_seconds": round(elapsed, 1),
+        "turn_details": turn_details,
+    }
+
     # Save results
-    model_name = model_path.rstrip("/").split("/")[-2]
-    output_path = f"/results/eval_{model_name}_{gcfg.gage_id}.json"
+    output_path = f"/results/{run_type}_{model_short}_{gcfg.gage_id}.json"
     with open(output_path, "w") as f:
         json.dump(result, f, indent=2, default=str)
 
     results_vol.commit()
 
-    logger.info("Best NSE: %s (target: %s)", result["best_nse"], gcfg.target_nse)
+    logger.info("-" * 60)
+    logger.info("Run type:    %s", run_type.upper())
+    logger.info("Best NSE:    %s", result["best_nse"])
+    logger.info("Target NSE:  %s", gcfg.target_nse)
+    logger.info("Target met:  %s", result["target_met"])
+    logger.info("Turns:       %d", result["num_turns"])
+    logger.info("Elapsed:     %.1fs", elapsed)
+    logger.info("Saved to:    %s", output_path)
+    logger.info("-" * 60)
+
     return result
 
 
 @app.local_entrypoint()
 def main(
-    model_path: str,
+    model_id: str = "Qwen/Qwen3-8B",
     gage_config: str = "configs/gages/02338660.yaml",
-    max_turns: int = 10,
+    max_turns: int = 100,
+    temperature: float = 0.7,
+    max_tokens: int = 2048,
 ):
-    """Local entrypoint for model evaluation."""
-    result = evaluate_model.remote(
-        model_path=model_path,
+    """Run inference evaluation on Modal.
+
+    Examples:
+        # Baseline
+        modal run modal_app/eval.py --model-id Qwen/Qwen3-8B
+
+        # SFT experiment
+        modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydro-distill
+
+        # RL experiment
+        modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydroLLM
+    """
+    result = run_inference.remote(
+        model_id=model_id,
         gage_config=gage_config,
         max_turns=max_turns,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
     print(json.dumps(result, indent=2, default=str))

@@ -102,6 +102,12 @@ class HydroEnvironment:
                     "stderr": result.stderr[:500],
                     "nse": -1.0,
                 }
+
+            # Log EF5 output for diagnostics
+            if result.stdout:
+                logger.info("EF5 stdout (last 500 chars): %s", result.stdout[-500:])
+            if result.stderr:
+                logger.info("EF5 stderr (last 500 chars): %s", result.stderr[-500:])
         except subprocess.TimeoutExpired:
             logger.warning("EF5 timed out after %d seconds", self.gage.ef5_timeout)
             self.nse_history.append(-1.0)
@@ -123,6 +129,13 @@ class HydroEnvironment:
 
         obs = sim_data["obs"]
         sim = sim_data["sim"]
+
+        # logger.info(
+        #     "Parsed %d timesteps (obs range: [%.2f, %.2f], sim range: [%.2f, %.2f])",
+        #     len(obs), float(np.min(obs)), float(np.max(obs)),
+        #     float(np.min(sim)), float(np.max(sim)),
+        # )
+
         nse = self._compute_nse(obs, sim)
         self.nse_history.append(nse)
 
@@ -330,8 +343,15 @@ TIME_END={g.time_end}
 TASK=Simu
 """
 
+    # Missing-value sentinel used by EF5 for no-data observations
+    _NODATA_THRESHOLD = -998.0
+
     def _parse_output(self) -> Optional[dict[str, np.ndarray]]:
-        """Parse the EF5 output CSV to extract observed and simulated timeseries."""
+        """Parse the EF5 output CSV to extract observed and simulated timeseries.
+
+        Filters out rows where either the observation or simulation value
+        is NaN or a missing-data sentinel (≤ -999).
+        """
         # Look for output file: ts.{gage_id}.crest.csv
         output_pattern = f"ts.{self.gage.gage_id}.crest.csv"
         output_file = self.output_dir / output_pattern
@@ -347,9 +367,14 @@ TASK=Simu
         try:
             obs_values = []
             sim_values = []
+            skipped = 0
+            skip_reasons = {"obs_nan": 0, "sim_nan": 0, "obs_nodata": 0, "sim_nodata": 0}
+            first_rows_logged = False
             with open(output_file) as f:
                 reader = csv.DictReader(f)
-                for row in reader:
+                # Log column headers
+                logger.info("CSV columns: %s", reader.fieldnames)
+                for row_idx, row in enumerate(reader):
                     # Column names from EF5 output
                     obs_col = None
                     sim_col = None
@@ -358,11 +383,51 @@ TASK=Simu
                             obs_col = col
                         if "discharge" in col.lower() and "observed" not in col.lower():
                             sim_col = col
+
+                    # Log first 3 rows for diagnosis
+                    if row_idx < 3:
+                        logger.info(
+                            "Row %d: obs_col=%s val=%s, sim_col=%s val=%s",
+                            row_idx,
+                            obs_col, row.get(obs_col, "N/A") if obs_col else "NO_COL",
+                            sim_col, row.get(sim_col, "N/A") if sim_col else "NO_COL",
+                        )
+
                     if obs_col and sim_col:
-                        obs_val = float(row[obs_col])
-                        sim_val = float(row[sim_col])
+                        try:
+                            obs_val = float(row[obs_col])
+                            sim_val = float(row[sim_col])
+                        except (ValueError, TypeError):
+                            skipped += 1
+                            continue
+
+                        # Filter out missing values: EF5 uses -999 as nodata,
+                        # and NaN can also appear in model output
+                        if np.isnan(obs_val):
+                            skip_reasons["obs_nan"] += 1
+                            skipped += 1
+                            continue
+                        if np.isnan(sim_val):
+                            skip_reasons["sim_nan"] += 1
+                            skipped += 1
+                            continue
+                        if obs_val <= self._NODATA_THRESHOLD:
+                            skip_reasons["obs_nodata"] += 1
+                            skipped += 1
+                            continue
+                        if sim_val <= self._NODATA_THRESHOLD:
+                            skip_reasons["sim_nodata"] += 1
+                            skipped += 1
+                            continue
+
                         obs_values.append(obs_val)
                         sim_values.append(sim_val)
+
+            if skipped > 0:
+                logger.info(
+                    "Skipped %d rows in %s — reasons: %s",
+                    skipped, output_file.name, skip_reasons,
+                )
 
             if not obs_values:
                 logger.warning("No valid data rows in %s", output_file)
@@ -381,7 +446,18 @@ TASK=Simu
         """Compute Nash-Sutcliffe Efficiency.
 
         NSE = 1 - sum((obs - sim)²) / sum((obs - mean(obs))²)
+
+        Handles residual NaN values by masking them out.
         """
+        # Mask out any remaining NaN values
+        valid = ~(np.isnan(obs) | np.isnan(sim))
+        obs = obs[valid]
+        sim = sim[valid]
+
+        if len(obs) == 0:
+            logger.warning("No valid obs/sim pairs for NSE computation")
+            return -1.0
+
         obs_mean = np.mean(obs)
         denominator = np.sum((obs - obs_mean) ** 2)
         if denominator == 0:
@@ -392,6 +468,9 @@ TASK=Simu
     @staticmethod
     def _peak_timing_error(obs: np.ndarray, sim: np.ndarray) -> int:
         """Compute peak timing error in hours (integer)."""
-        obs_peak_idx = int(np.argmax(obs))
-        sim_peak_idx = int(np.argmax(sim))
+        # Mask NaN for argmax
+        obs_clean = np.where(np.isnan(obs), -np.inf, obs)
+        sim_clean = np.where(np.isnan(sim), -np.inf, sim)
+        obs_peak_idx = int(np.argmax(obs_clean))
+        sim_peak_idx = int(np.argmax(sim_clean))
         return abs(obs_peak_idx - sim_peak_idx)

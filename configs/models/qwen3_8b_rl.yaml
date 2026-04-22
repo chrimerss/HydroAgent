@@ -1,0 +1,25 @@
+# Qwen3-8B RL configuration — GRPO on top of SFT model
+# Base model: chrimerss/Qwen-3-8B-hydro-distill (SFT output)
+# Output model: chrimerss/Qwen-3-8B-hydroLLM
+name: "qwen3-8b-rl"
+model_id: "chrimerss/Qwen-3-8B-hydro-distill"
+hf_repo_id: "chrimerss/Qwen-3-8B-hydroLLM"
+
+# LoRA configuration (same architecture as SFT)
+lora_r: 16
+lora_alpha: 32
+lora_target_modules:
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  - "gate_proj"
+  - "up_proj"
+  - "down_proj"
+
+# Training (lower LR for RL fine-tuning on SFT base)
+learning_rate: 5.0e-6
+grad_accum_steps: 4
+
+# GPU mode
+gpu_mode: "colocate"

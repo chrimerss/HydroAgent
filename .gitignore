@@ -43,6 +43,8 @@ checkpoints/
 
 # Data (downloaded at build time)
 data/
+*.tar
+sets_for_SFT_RL/
 
 # Results (generated)
 results/

@@ -87,6 +87,7 @@ class ModelConfig:
 
     name: str
     model_id: str  # HuggingFace model ID
+    hf_repo_id: str = ""  # HuggingFace repo for pushing trained model
     lora_r: int = 16
     lora_alpha: int = 32
     lora_target_modules: list[str] = field(

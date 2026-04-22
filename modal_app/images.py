@@ -55,6 +55,7 @@ train_image = (
         "PATH": "/EF5/bin:$PATH",
         "VLLM_USE_V1": "0",
         "TORCH_COMPILE_DISABLE": "1",  # Prevents SymInt crash in vLLM model loading
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
     })
     # ----- Python training stack -----
     # Stage 1: PyTorch (pins CUDA/nvidia library versions)
@@ -76,12 +77,16 @@ train_image = (
         "wandb",
         "pyyaml",
         "jmespath",
+        "huggingface_hub",
+        "hf_transfer",
     )
     # ----- Add project source code -----
     .add_local_dir("src/hydrollm", remote_path="/root/hydrollm")
     .add_local_dir("modal_app", remote_path="/root/modal_app")
     .add_local_file("control.txt", "/app/data/docs/control.txt")
     .add_local_dir("configs", "/app/configs")
+    # SFT training data (if available locally)
+    .add_local_dir("data", "/app/data/sft")
 )
 
 
@@ -117,6 +122,7 @@ eval_image = (
         "EF5_EXECUTABLE": "/EF5/bin/ef5",
         "PATH": "/EF5/bin:$PATH",
         "VLLM_USE_V1": "0",  # V1 engine has torch.compile SymInt bug with Qwen2
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
     })
     .uv_pip_install(
         "vllm>=0.6",
@@ -126,6 +132,7 @@ eval_image = (
         "pandas==2.2.2",
         "scipy==1.13.1",
         "pyyaml",
+        "hf_transfer",
     )
     .add_local_dir("src/hydrollm", remote_path="/root/hydrollm")
     .add_local_dir("modal_app", remote_path="/root/modal_app")

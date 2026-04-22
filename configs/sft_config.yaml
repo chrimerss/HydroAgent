@@ -1,0 +1,24 @@
+# SFT hyperparameters for distillation from GPT-4o calibration trajectories
+# Used by modal_app/sft.py
+
+# Training
+num_train_epochs: 3
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 2.0e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+max_seq_length: 4096
+bf16: true
+
+# Logging
+logging_steps: 5
+save_steps: 100
+report_to: wandb
+run_name: "hydrollm-sft-distill"
+
+# Output
+hf_repo_id: "chrimerss/Qwen-3-8B-hydro-distill"
+
+# Data
+sft_data_path: "data/sft_train.jsonl"

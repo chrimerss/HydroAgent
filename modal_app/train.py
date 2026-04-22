@@ -1,12 +1,20 @@
-"""Modal entrypoint for GRPO training with PEFT + bitsandbytes + TRL.
+"""Modal entrypoint for GRPO training with PEFT + TRL.
 
-Replaces Unsloth (which has a chunked log-softmax bug in its compiled
-GRPO trainer) with standard HuggingFace PEFT + bitsandbytes for 4-bit
-LoRA, and vanilla TRL GRPOTrainer.
+Supports two modes:
+1. Training from base Qwen3-8B (default)
+2. Training from SFT model (chrimerss/Qwen-3-8B-hydro-distill)
+
+After training, merges LoRA weights and pushes to HuggingFace.
 
 Usage:
+    # Train from base model
     modal run modal_app/train.py
-    modal run modal_app/train.py --model-config configs/models/qwen3_8b.yaml
+
+    # Train from SFT model (Phase 2: SFT → RL)
+    modal run modal_app/train.py --model-config configs/models/qwen3_8b_rl.yaml
+
+    # Explicit base model override
+    modal run modal_app/train.py --base-model chrimerss/Qwen-3-8B-hydro-distill
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ vol = modal.Volume.from_name("hydrollm-checkpoints", create_if_missing=True)
 def train(
     model_config: str = "configs/models/qwen3_8b.yaml",
     train_config: str = "configs/train_config.yaml",
+    base_model: str = "",
 ):
     """Run GRPO training for a single model configuration.
 
@@ -44,6 +53,7 @@ def train(
     Args:
         model_config: Path to model-specific YAML config.
         train_config: Path to shared training YAML config.
+        base_model: Override the base model ID (e.g., to start from SFT model).
     """
     import logging
     import torch
@@ -63,9 +73,16 @@ def train(
     mcfg = load_model_config(f"/app/{model_config}")
     tcfg = load_train_config(f"/app/{train_config}")
 
+    # Allow CLI override of base model
+    effective_model_id = base_model if base_model else mcfg.model_id
+
     logger.info("=" * 60)
     logger.info("HydroLLM GRPO Training")
-    logger.info("Model: %s", mcfg.model_id)
+    logger.info("Base model: %s", effective_model_id)
+    if effective_model_id != mcfg.model_id:
+        logger.info("  (overridden from config: %s)", mcfg.model_id)
+    if mcfg.hf_repo_id:
+        logger.info("Push target: %s", mcfg.hf_repo_id)
     logger.info("Stack: PEFT + BF16 + TRL")
     logger.info("Epochs: %d, Generations: %d, Max turns: %d",
                 tcfg.num_train_epochs, tcfg.num_generations, tcfg.max_turns)
@@ -79,15 +96,16 @@ def train(
 
     # Load model in BF16 (full precision, no quantization)
     model = AutoModelForCausalLM.from_pretrained(
-        mcfg.model_id,
+        effective_model_id,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         attn_implementation="sdpa",  # PyTorch built-in scaled dot product attention
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
-        mcfg.model_id,
+        effective_model_id,
         trust_remote_code=True,
+        extra_special_tokens={},  # Workaround for Qwen tokenizer save bug
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -149,24 +167,75 @@ def train(
     logger.info("Starting GRPO training...")
     trainer.train()
 
-    # Save final model
-    final_dir = f"{output_dir}/final"
-    logger.info("Saving final model to %s", final_dir)
-    trainer.save_model(final_dir)
-    tokenizer.save_pretrained(final_dir)
+    # Save final LoRA checkpoint
+    lora_dir = f"{output_dir}/lora_final"
+    logger.info("Saving LoRA checkpoint to %s", lora_dir)
+    trainer.save_model(lora_dir)
+    tokenizer.save_pretrained(lora_dir)
+
+    # Merge LoRA into base model
+    logger.info("Merging LoRA weights into base model...")
+    merged_dir = f"{output_dir}/merged_final"
+
+    from peft import PeftModel
+
+    # Reload base model (fresh)
+    base = AutoModelForCausalLM.from_pretrained(
+        effective_model_id,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+    )
+    merged = PeftModel.from_pretrained(base, lora_dir)
+    merged = merged.merge_and_unload()
+    merged.save_pretrained(merged_dir)
+    tokenizer.save_pretrained(merged_dir)
+    logger.info("Merged model saved to %s", merged_dir)
+
+    # Fix tokenizer config bug on disk
+    import json
+    import os
+    tok_conf_path = os.path.join(merged_dir, "tokenizer_config.json")
+    if os.path.exists(tok_conf_path):
+        with open(tok_conf_path, "r") as f:
+            tcfg = json.load(f)
+        if isinstance(tcfg.get("extra_special_tokens"), list):
+            tcfg["extra_special_tokens"] = {}
+            with open(tok_conf_path, "w") as f:
+                json.dump(tcfg, f, indent=2)
+            logger.info("Fixed tokenizer_config.json extra_special_tokens bug")
+
+    # Push to HuggingFace
+    hf_repo_id = mcfg.hf_repo_id
+    if hf_repo_id:
+        logger.info("Pushing merged model to HuggingFace: %s", hf_repo_id)
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            api.create_repo(hf_repo_id, exist_ok=True)
+            api.upload_folder(
+                folder_path=merged_dir,
+                repo_id=hf_repo_id,
+                commit_message=f"GRPO RL-trained on gage {gage_cfg.gage_id}",
+            )
+            logger.info("✓ Model pushed to https://huggingface.co/%s", hf_repo_id)
+        except Exception as e:
+            logger.error("Push to HuggingFace failed: %s", e)
+            logger.info("Model saved at %s — push manually later", merged_dir)
 
     # Persist to volume
     vol.commit()
-    logger.info("Training complete! Model saved to %s", final_dir)
+    logger.info("Training complete! Model saved to %s", merged_dir)
 
 
 @app.local_entrypoint()
 def main(
     model_config: str = "configs/models/qwen3_8b.yaml",
     train_config: str = "configs/train_config.yaml",
+    base_model: str = "",
 ):
     """Local entrypoint — dispatches training to Modal cloud."""
     train.remote(
         model_config=model_config,
         train_config=train_config,
+        base_model=base_model,
     )
