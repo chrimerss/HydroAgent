@@ -52,3 +52,6 @@ results/
 
 # Logs
 *.log
+
+CLAUDE.md
+*.json

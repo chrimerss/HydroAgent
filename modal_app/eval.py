@@ -46,6 +46,30 @@ def classify_model(model_id: str) -> str:
     return "experiment"
 
 
+def _compact_tool_result(tool_name: str, data: dict) -> str:
+    """Return a short summary of tool output for the conversation context."""
+    status = data.get("status", "error")
+    if status == "error":
+        return json.dumps({"status": "error", "message": data.get("message", "")})
+
+    if tool_name == "set_parameters":
+        params = data.get("validated_params", {})
+        return json.dumps({"status": "ok", "params": params})
+
+    if tool_name == "run_simulation":
+        return json.dumps({"status": "ok", "run": data.get("run_number")})
+
+    if tool_name == "evaluate":
+        return json.dumps({
+            "status": "ok",
+            "nse": data.get("nse") or data.get("current_nse"),
+            "best_nse": data.get("best_nse"),
+            "target_met": data.get("target_met"),
+        })
+
+    return json.dumps({"status": status})
+
+
 @app.function(
     image=eval_image,
     gpu="H100:1",
@@ -134,6 +158,8 @@ def run_inference(
     turn_details = []
     start_time = time.time()
 
+    max_prompt_tokens = 8192 - max_tokens  # reserve room for the completion
+
     try:
         for turn in range(max_turns):
             logger.info("Turn %d/%d", turn + 1, max_turns)
@@ -145,6 +171,18 @@ def run_inference(
                 tokenize=False,
                 add_generation_prompt=True,
             )
+
+            # Trim oldest mid-conversation turns if prompt exceeds context budget
+            prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False))
+            while prompt_len > max_prompt_tokens and len(messages) > 2:
+                messages.pop(1)  # drop oldest turn after system message
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tools=HYDRO_TOOLS,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False))
 
             # Generate
             outputs = llm.generate(prompt, sampling_params)
@@ -184,7 +222,7 @@ def run_inference(
                 messages.append({
                     "role": "tool",
                     "name": tool_name,
-                    "content": result_str,
+                    "content": _compact_tool_result(tool_name, result_data),
                 })
 
                 turn_details.append({
@@ -195,23 +233,25 @@ def run_inference(
 
     finally:
         elapsed = time.time() - start_time
-        eval_result = env.evaluate()
         env.cleanup()
+
+    nse_hist = env.nse_history
+    best_nse = max(nse_hist) if nse_hist else None
 
     result = {
         "model": model_id,
         "run_type": run_type,
         "gage_id": gcfg.gage_id,
-        "final_nse": eval_result["current_nse"],
-        "best_nse": eval_result["best_nse"],
-        "nse_history": eval_result["nse_history"],
+        "final_nse": nse_hist[-1] if nse_hist else None,
+        "best_nse": round(best_nse, 4) if best_nse is not None else None,
+        "nse_history": [round(n, 4) for n in nse_hist],
         "num_turns": len(turn_details),
-        "num_simulation_runs": eval_result["num_runs"],
+        "num_simulation_runs": env.run_count,
         "valid_tool_calls": valid_tool_calls,
         "invalid_tool_calls": invalid_tool_calls,
         "parameter_trajectory": parameter_trajectory,
         "target_nse": gcfg.target_nse,
-        "target_met": eval_result["target_met"],
+        "target_met": best_nse is not None and best_nse > gcfg.target_nse,
         "elapsed_seconds": round(elapsed, 1),
         "turn_details": turn_details,
     }

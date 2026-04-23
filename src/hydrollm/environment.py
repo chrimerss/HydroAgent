@@ -77,10 +77,13 @@ class HydroEnvironment:
         }
 
     def run_simulation(self) -> dict:
-        """Execute EF5 with current parameters and return a hydrograph summary.
+        """Execute EF5 with current parameters.
 
-        Returns a dict with NSE, peak flows, volume ratio, timing error,
-        or an error description if the simulation fails.
+        Runs EF5 binary and verifies output CSV was created.
+        Does NOT calculate NSE - call evaluate() to compute metrics.
+
+        Returns:
+            dict with execution status and run_number
         """
         self.run_count += 1
         try:
@@ -95,12 +98,10 @@ class HydroEnvironment:
                 logger.warning(
                     "EF5 exited with code %d: %s", result.returncode, result.stderr[:500]
                 )
-                self.nse_history.append(-1.0)
                 return {
                     "status": "error",
                     "message": f"EF5 exited with code {result.returncode}",
                     "stderr": result.stderr[:500],
-                    "nse": -1.0,
                 }
 
             # Log EF5 output for diagnostics
@@ -110,58 +111,25 @@ class HydroEnvironment:
                 logger.info("EF5 stderr (last 500 chars): %s", result.stderr[-500:])
         except subprocess.TimeoutExpired:
             logger.warning("EF5 timed out after %d seconds", self.gage.ef5_timeout)
-            self.nse_history.append(-1.0)
             return {
                 "status": "error",
                 "message": f"EF5 timed out after {self.gage.ef5_timeout}s",
-                "nse": -1.0,
             }
 
-        # Parse output
-        sim_data = self._parse_output()
-        if sim_data is None:
-            self.nse_history.append(-1.0)
+        # Verify output CSV was created
+        output_csv = self._find_output_csv()
+        if output_csv is None:
             return {
                 "status": "error",
-                "message": "Could not parse simulation output",
-                "nse": -1.0,
+                "message": "Simulation completed but no output CSV found",
             }
-
-        obs = sim_data["obs"]
-        sim = sim_data["sim"]
-
-        # logger.info(
-        #     "Parsed %d timesteps (obs range: [%.2f, %.2f], sim range: [%.2f, %.2f])",
-        #     len(obs), float(np.min(obs)), float(np.max(obs)),
-        #     float(np.min(sim)), float(np.max(sim)),
-        # )
-
-        nse = self._compute_nse(obs, sim)
-        self.nse_history.append(nse)
 
         return {
             "status": "ok",
-            "nse": round(nse, 4),
-            "peak_sim_m3s": round(float(np.max(sim)), 2),
-            "peak_obs_m3s": round(float(np.max(obs)), 2),
-            "volume_ratio": round(float(np.sum(sim) / max(np.sum(obs), 1e-6)), 3),
-            "timing_error_hours": self._peak_timing_error(obs, sim),
+            "message": f"Simulation completed successfully (run #{self.run_count})",
+            "output_file": str(output_csv.name),
             "run_number": self.run_count,
         }
-
-    def evaluate(self) -> dict:
-        """Return detailed evaluation metrics from all simulation runs."""
-        best_nse = max(self.nse_history) if self.nse_history else None
-        return {
-            "current_nse": self.nse_history[-1] if self.nse_history else None,
-            "best_nse": round(best_nse, 4) if best_nse is not None else None,
-            "nse_history": [round(n, 4) for n in self.nse_history],
-            "num_runs": self.run_count,
-            "target_nse": self.gage.target_nse,
-            "target_met": (best_nse is not None and best_nse > self.gage.target_nse),
-            "current_params": {k: round(v, 6) for k, v in self.current_params.items()},
-        }
-
     def cleanup(self):
         """Remove the sandbox directory."""
         shutil.rmtree(self.sandbox_dir, ignore_errors=True)
@@ -174,7 +142,7 @@ class HydroEnvironment:
         """Set parameters and run simulation, returning the NSE score."""
         self.set_parameters(params)
         result = self.run_simulation()
-        return result.get("nse", -1.0)
+        return result.get("nse", -999)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -186,9 +154,138 @@ class HydroEnvironment:
         if obs_dir.exists():
             csv_files = list(obs_dir.glob("*.csv"))
             if csv_files:
+                logger.info("Found obs file: %s", csv_files[0])
                 return csv_files[0].name
-        # Fallback: check for common name patterns
-        return f"{self.gage.gage_id}_obs.csv"
+            logger.warning("obs_dir %s exists but contains no CSV files", obs_dir)
+        else:
+            logger.warning("obs_dir %s does not exist", obs_dir)
+        fallback = f"{self.gage.gage_id}_obs.csv"
+        logger.warning("Using fallback obs filename: %s", fallback)
+        return fallback
+
+    def _find_output_csv(self) -> Optional[Path]:
+        """Find the most recent output CSV file from EF5 simulation.
+
+        Returns:
+            Path to the output CSV file, or None if not found
+        """
+        # Look for standard pattern: ts.{gage_id}.crest.csv
+        standard_pattern = f"ts.{self.gage.gage_id}.crest.csv"
+        output_file = self.output_dir / standard_pattern
+
+        if output_file.exists():
+            return output_file
+
+        # Try alternative patterns
+        candidates = list(self.output_dir.glob(f"ts.{self.gage.gage_id}*.csv"))
+        if candidates:
+            # Return the most recently modified file
+            return max(candidates, key=lambda p: p.stat().st_mtime)
+
+        logger.warning("No output file found matching patterns for gage %s", self.gage.gage_id)
+        return None
+
+    def evaluate(self) -> dict:
+        """Calculate NSE from the most recent simulation output CSV.
+
+        Parses the EF5 output CSV to extract observed/simulated discharge,
+        then computes Nash-Sutcliffe Efficiency. Updates nse_history.
+
+        Returns:
+            dict with NSE value and status
+        """
+        csv_path = self._find_output_csv()
+        if csv_path is None:
+            logger.error("No output CSV found for NSE calculation")
+            return {"status": "error", "message": "No output CSV found", "nse": -1.0}
+
+        try:
+            obs, sim = self._parse_output_csv(csv_path)
+            if obs is None or sim is None:
+                self.nse_history.append(-999.0)
+                return {"status": "error", "message": "Failed to parse CSV or no valid data", "nse": -999.0}
+
+            nse = self._compute_nse(obs, sim)
+            self.nse_history.append(nse)
+            return {
+                "status": "ok",
+                "nse": round(nse, 4),
+                "message": f"NSE calculated from {len(obs)} data points",
+                "num_points": len(obs),
+            }
+        except Exception as e:
+            logger.error("Unexpected error in evaluate: %s", e)
+            self.nse_history.append(-999.0)
+            return {"status": "error", "message": f"Unexpected error: {e}", "nse": -999.0}
+
+    @staticmethod
+    def _compute_nse(obs: np.ndarray, sim: np.ndarray) -> float:
+        """Compute Nash-Sutcliffe Efficiency between observed and simulated."""
+        valid = ~(np.isnan(obs) | np.isnan(sim))
+        obs_c, sim_c = obs[valid], sim[valid]
+        if len(obs_c) == 0:
+            return -1.0
+        denom = np.sum((obs_c - np.mean(obs_c)) ** 2)
+        if denom == 0:
+            return 0.0
+        return float(1.0 - np.sum((obs_c - sim_c) ** 2) / denom)
+
+    @staticmethod
+    def _parse_output_csv(csv_path: Path) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Parse EF5 output CSV and extract observed/simulated discharge arrays."""
+        obs_values: list[float] = []
+        sim_values: list[float] = []
+        try:
+            with open(csv_path, "r") as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames or []
+                logger.info("CSV columns: %s", fieldnames)
+
+                obs_col = next(
+                    (c for c in fieldnames if "observed" in c.lower() or "obs" in c.lower()),
+                    None,
+                )
+                sim_col = next(
+                    (c for c in fieldnames
+                     if ("discharge" in c.lower() or "sim" in c.lower())
+                     and "observed" not in c.lower()),
+                    None,
+                )
+
+                if obs_col is None or sim_col is None:
+                    logger.error("Cannot identify obs/sim columns. Available: %s", fieldnames)
+                    return None, None
+
+                logger.info("Using columns: obs='%s', sim='%s'", obs_col, sim_col)
+                total_rows = 0
+                skipped_nodata = 0
+                for row in reader:
+                    total_rows += 1
+                    try:
+                        ov = float(row[obs_col]) if row[obs_col] else float("nan")
+                        sv = float(row[sim_col]) if row[sim_col] else float("nan")
+                        if np.isnan(ov) or np.isnan(sv) or ov <= -999 or sv <= -999:
+                            skipped_nodata += 1
+                            if total_rows <= 3:
+                                logger.info("Row %d skipped: obs=%s sim=%s", total_rows, ov, sv)
+                            continue
+                        obs_values.append(ov)
+                        sim_values.append(sv)
+                    except (ValueError, KeyError):
+                        skipped_nodata += 1
+                        continue
+
+            if not obs_values:
+                logger.warning(
+                    "No valid data in %s (%d rows, %d skipped as nodata/invalid)",
+                    csv_path, total_rows, skipped_nodata,
+                )
+                return None, None
+            logger.info("Parsed %d valid rows from %d total", len(obs_values), total_rows)
+            return np.array(obs_values), np.array(sim_values)
+        except Exception as e:
+            logger.error("Error reading CSV %s: %s", csv_path, e)
+            return None, None
 
     def _validate_and_clamp(self, params: dict[str, float]) -> dict[str, float]:
         """Validate parameter names and clamp values to valid ranges."""
@@ -218,6 +315,12 @@ class HydroEnvironment:
         # Fix paths for sandbox
         content = self._fix_output_path(content)
         content = self._fix_obs_filename(content)
+
+        # Log the OBS line for diagnosis
+        for line in content.splitlines():
+            if line.strip().upper().startswith("OBS="):
+                logger.info("Control file OBS path: %s", line.strip())
+                break
 
         self.control_path.write_text(content)
 

@@ -3,8 +3,8 @@ name: "qwen3-8b"
 model_id: "Qwen/Qwen3-8B"
 
 # LoRA configuration
-lora_r: 16
-lora_alpha: 32
+lora_r: 8
+lora_alpha: 16
 lora_target_modules:
   - "q_proj"
   - "k_proj"

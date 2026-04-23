@@ -85,6 +85,7 @@ train_image = (
     .add_local_dir("modal_app", remote_path="/root/modal_app")
     .add_local_file("control.txt", "/app/data/docs/control.txt")
     .add_local_dir("configs", "/app/configs")
+    .add_local_dir("scripts", "/app/scripts")
     # SFT training data (if available locally)
     .add_local_dir("data", "/app/data/sft")
 )
