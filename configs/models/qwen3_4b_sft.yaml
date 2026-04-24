@@ -1,0 +1,21 @@
+# Qwen3-8B SFT configuration — distillation from GPT-4o
+# Output model: chrimerss/Qwen-3-8B-hydro-distill
+name: "qwen3-4b-sft"
+model_id: "Qwen/Qwen3-4B-Instruct-2507"
+hf_repo_id: "chrimerss/Qwen-3-4B-hydro-distill"
+
+# LoRA configuration (same architecture as RL for compatibility)
+lora_r: 8
+lora_alpha: 16
+lora_target_modules:
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  - "gate_proj"
+  - "up_proj"
+  - "down_proj"
+
+# Training
+learning_rate: 2.0e-5
+grad_accum_steps: 8

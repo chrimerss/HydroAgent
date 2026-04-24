@@ -152,7 +152,7 @@ class HydroEnvironment:
         """Discover the observation file in the gage data directory."""
         obs_dir = Path(self.gage.obs_dir)
         if obs_dir.exists():
-            csv_files = list(obs_dir.glob("*.csv"))
+            csv_files = list(obs_dir.glob("USGS*.csv"))
             if csv_files:
                 logger.info("Found obs file: %s", csv_files[0])
                 return csv_files[0].name
