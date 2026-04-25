@@ -1,11 +1,8 @@
 # HydroLLM
 
-**SFT + RL fine-tuning of LLMs for hydrologic model calibration.**
+**RL fine-tuning of LLMs for hydrologic model calibration.**
 
-HydroLLM trains open-source tool-calling language models to calibrate the EF5/CREST distributed hydrologic model via a two-stage pipeline:
-
-1. **SFT (Supervised Fine-Tuning)**: Distill GPT-4o calibration expertise into Qwen3-8B using 2,500+ multi-turn trajectories across 29 USGS gages → [`Qwen-3-8B-hydro-distill`](https://huggingface.co/chrimerss/Qwen-3-8B-hydro-distill)
-2. **RL (GRPO)**: Reinforce with online EF5 simulation feedback on target gages → [`Qwen-3-8B-hydroLLM`](https://huggingface.co/chrimerss/Qwen-3-8B-hydroLLM)
+HydroLLM trains open-source tool-calling language models to calibrate the EF5/CREST distributed hydrologic model. The active pipeline is **multi-turn GRPO via verl + SGLang** on `Qwen3-4B-Instruct-2507`, with an in-process EF5 tool. A legacy SFT path (Qwen3-8B distilled from GPT-4o trajectories) is preserved but not the recommended starting point — bootstrapping the tool-call format via prompt + format reward (set in `verl_tools.py`) is sufficient.
 
 ## Motivation
 
@@ -33,24 +30,21 @@ The SFT stage teaches the model calibration reasoning and tool usage from 73 exp
 
 ## Model
 
-Training uses **Qwen3-8B** with LoRA adapters in BF16 precision on a single H100 GPU:
+Training uses **Qwen3-4B-Instruct-2507** with **full fine-tuning** in BF16 + FSDP across 4 H100 GPUs, served by SGLang during rollouts:
 
 | Setting | Value |
 |---------|-------|
-| Base model | `Qwen/Qwen3-8B` |
-| Precision | BF16 (no quantization) |
-| LoRA rank | 16 (α=32) |
-| GPU | 1×H100 (80 GB) |
-| Attention | PyTorch SDPA |
-| Training stack | PEFT + TRL GRPOTrainer |
+| Base model | `Qwen/Qwen3-4B-Instruct-2507` |
+| Precision | BF16 |
+| Tuning | Full FT (FSDP, no LoRA) |
+| GPU | 4×H100 (80 GB each) |
+| Attention | flash-attn 2 |
+| Rollout backend | SGLang (multi-turn tool dispatch) |
+| Training stack | verl 0.5 GRPO trainer |
 
-**Why Qwen3?** Qwen3's dual-mode reasoning (thinking + non-thinking) and improved tool-calling are well-suited for iterative hydrologic calibration, where the model must reason about parameter adjustments based on hydrograph errors.
+**Why Qwen3-4B?** Qwen3-Instruct ships with native tool-calling (Hermes-style `<tool_call>` JSON) and the 4B variant is the largest model that runs comfortably with full FT + FSDP on 4×H100, leaving room for K=8 multi-turn rollouts in the rollout engine.
 
-**Why not Unsloth/vLLM?** Both have compatibility issues with the current PyTorch/CUDA stack:
-- Unsloth's compiled GRPO trainer has a chunked log-softmax bug (shape mismatch in `torch.gather`)
-- vLLM's torch.compile has a SymInt bug with bitsandbytes quantization
-
-The standard PEFT + TRL stack is more stable and 8B in BF16 (~16 GB) fits comfortably on a single H100 with room for LoRA gradients and optimizer states.
+**Why verl + SGLang and not TRL/vLLM?** TRL's GRPOTrainer doesn't natively dispatch registered Python tools mid-rollout — multi-turn tool use requires manual interleaving of generation and tool execution. verl handles this via its multi-turn rollout abstraction. Within verl, **SGLang** is the only rollout backend (in v0.5) that actually invokes registered tool classes; vLLM in v0.5 only parses `<tool_call>` blocks for telemetry without dispatching to Python functions. Full FT is used because verl 0.5 + SGLang's weight-transfer path doesn't unwrap PEFT's `base_model.model.*` prefix, which makes LoRA infeasible without per-step merge-and-unload (not built in).
 
 ## Project Structure
 
@@ -65,26 +59,31 @@ HydroLLM/
 ├── src/hydrollm/               # Core library
 │   ├── config.py               # Configuration dataclasses + YAML loaders
 │   ├── environment.py          # Thread-safe EF5 simulation sandbox
-│   ├── tools.py                # Tool definitions + executor + parser
-│   ├── reward.py               # Trajectory-level NSE reward function
-│   ├── dataset.py              # Multi-gage HF dataset builder (GRPO)
+│   ├── tools.py                # Legacy tool defs + parser (TRL path)
+│   ├── verl_tools.py           # verl-compatible BaseTool subclasses (RL)
+│   ├── verl_reward.py          # verl custom_reward_function (RL)
+│   ├── reward.py               # Legacy trajectory reward (TRL path)
+│   ├── dataset.py              # HF dataset builder (TRL path)
 │   ├── sft_dataset.py          # SFT dataset loader
 │   ├── prompts.py              # System/user prompt templates
 │   └── baseline.py             # Base model inference evaluator
 │
 ├── modal_app/                  # Modal serverless deployment
-│   ├── images.py               # Modal image definitions
-│   ├── sft.py                  # SFT training entrypoint
-│   ├── train.py                # GRPO training entrypoint
+│   ├── images.py               # train_image (verl/SGLang), sft_image, eval_image
+│   ├── sft.py                  # SFT training entrypoint (legacy TRL)
+│   ├── train.py                # verl GRPO training entrypoint
 │   └── eval.py                 # Unified inference evaluation
 │
 ├── configs/
-│   ├── sft_config.yaml         # SFT hyperparameters
-│   ├── train_config.yaml       # Shared GRPO hyperparameters
-│   ├── models/                 # Per-model training configs
-│   │   ├── qwen3_8b.yaml       # Base model (Qwen3-8B)
-│   │   ├── qwen3_8b_sft.yaml   # SFT distillation config
-│   │   └── qwen3_8b_rl.yaml    # RL config (starts from SFT)
+│   ├── sft_config.yaml         # SFT hyperparameters (legacy)
+│   ├── train_config.yaml       # Gage list + shared training settings
+│   ├── verl/                   # verl GRPO configs (active)
+│   │   ├── tool_config.yaml    # Tool schemas + class registration
+│   │   └── qwen3_4b_grpo.yaml  # Hydra overlay on verl ppo_trainer
+│   ├── models/                 # Legacy TRL-path model configs
+│   │   ├── qwen3_8b.yaml
+│   │   ├── qwen3_8b_sft.yaml
+│   │   └── qwen3_8b_rl.yaml
 │   └── gages/                  # Per-gage watershed configs
 │       └── 02338660.yaml
 │
@@ -95,7 +94,8 @@ HydroLLM/
 │                               # (73 experiments × 29 gages)
 │
 ├── scripts/                    # Utility scripts
-│   ├── prepare_sft_data.py     # Convert calibration histories → JSONL
+│   ├── prepare_sft_data.py     # Convert calibration histories → JSONL (SFT)
+│   ├── build_verl_dataset.py   # Convert gage configs → parquet (RL)
 │   ├── test_env_local.py       # Environment sanity check
 │   └── push_model.py           # Push model to HuggingFace
 │
@@ -106,6 +106,19 @@ HydroLLM/
 ```
 
 ## Quick Start
+
+### TL;DR — train the RL model
+
+```bash
+pip install modal
+modal token new
+modal secret create wandb HF_TOKEN=...      # one-time
+modal secret create huggingface HF_TOKEN=...
+
+modal run modal_app/train.py
+```
+
+That's it. The default path runs verl GRPO on `Qwen3-4B-Instruct-2507` for the gage at `configs/gages/02338660.yaml` on 4×H100. First image build is ~15 min (flash-attn compile); subsequent runs reuse cached layers.
 
 ### Prerequisites
 
@@ -127,60 +140,66 @@ modal secret create wandb WANDB_API_KEY=your_wandb_key
 modal secret create huggingface HF_TOKEN=your_hf_token
 ```
 
-### 3. Run Baseline Evaluation (Phase 0)
+### 3. Run Baseline Evaluation
 
-Evaluate the base Qwen3 model _before_ any training to establish the performance floor:
+Evaluate the base model _before_ training to establish the performance floor:
 
 ```bash
-modal run modal_app/eval.py --model-id Qwen/Qwen3-8B
+modal run modal_app/eval.py --model-id Qwen/Qwen3-4B-Instruct-2507
 ```
 
 Results are saved to the `hydrollm-results` Modal Volume.
 
-### 4. Prepare SFT Data
+### 4. RL Training (verl GRPO + SGLang on 4×H100)
 
-Convert GPT-4o calibration histories to multi-turn chat format:
+The default config trains `Qwen3-4B-Instruct-2507` directly with multi-turn rollouts and an in-process EF5 tool:
 
 ```bash
-python scripts/prepare_sft_data.py
+modal run modal_app/train.py
 ```
 
-This processes 73 calibration experiments across 29 gages and outputs `data/sft_train.jsonl` (2,576 quality-weighted examples).
-
-### 5. SFT Training (Phase 1)
-
-Distill GPT-4o calibration expertise into Qwen3-8B:
+Override defaults via Hydra-style overrides (semicolon-separated):
 
 ```bash
-modal run modal_app/sft.py
+# Shorter run
+modal run modal_app/train.py --extra-overrides "trainer.total_epochs=10"
+
+# Larger train batch
+modal run modal_app/train.py --extra-overrides "data.train_batch_size=16;trainer.total_epochs=20"
+
+# Different gage list
+modal run modal_app/train.py --train-config configs/train_config.yaml
 ```
 
-The SFT model is automatically pushed to [`chrimerss/Qwen-3-8B-hydro-distill`](https://huggingface.co/chrimerss/Qwen-3-8B-hydro-distill).
+What happens under the hood, in order:
+1. Modal builds the training image: `verlai/verl:app-verl0.5-sglang0.4.8-mcore0.13.0-te2.2` + EF5 binary + flash-attn (built from source on first run).
+2. `scripts/build_verl_dataset.py` writes `train.parquet` / `val.parquet` to the Modal volume — each row carries the chat prompt plus `extra_info.tools_kwargs` so verl knows how to instantiate `HydroEnvironment` per rollout.
+3. `python -m verl.trainer.main_ppo` is launched with the Hydra config at `configs/verl/qwen3_4b_grpo.yaml` (which composes on top of verl's `ppo_trainer` defaults via the `defaults` block + `hydra.searchpath`).
+4. SGLang serves rollouts with K=8 generations per prompt; for each rollout it dispatches `set_parameters` → `run_simulation` → `evaluate` to the registered `BaseTool` subclasses in `src/hydrollm/verl_tools.py`. Each tool runs in-process and returns a per-turn reward (`+0.02` for valid `set_parameters`, `+0.05` for `run_simulation`, ΔNSE for `evaluate`, `−0.5` for invalid).
+5. After the trajectory completes, `verl_reward.compute_score` adds the terminal NSE bonus (best-NSE clipped + `+0.5` if NSE > target − `0.02·n_runs`).
+6. Checkpoints land in `/checkpoints/qwen3-4b-grpo` on the persistent Modal Volume; W&B logs `pg_loss`, `grad_norm`, `critic/score/mean`, and `actor/entropy` per step.
 
-### 6. GRPO RL Training (Phase 2)
+Monitor on [W&B](https://wandb.ai) — look for `critic/score/mean` rising above the validation step:0 baseline (~−0.6 for the raw model on gage 02338660) and `pg_loss` non-zero (zero `pg_loss` means no GRPO variance → broken setup, not just slow learning).
 
-Reinforce the SFT model with online EF5 simulation feedback:
+### 5. SFT Training (legacy)
+
+Only useful if you want to compare against a distilled-from-GPT-4o baseline:
 
 ```bash
-modal run modal_app/train.py \
-    --model-config configs/models/qwen3_8b_rl.yaml
+python scripts/prepare_sft_data.py     # builds data/sft_train.jsonl (2,576 examples)
+modal run modal_app/sft.py             # uses sft_image (TRL stack), pushes to chrimerss/Qwen-3-8B-hydro-distill
 ```
 
-The RL model is automatically pushed to [`chrimerss/Qwen-3-8B-hydroLLM`](https://huggingface.co/chrimerss/Qwen-3-8B-hydroLLM).
+The SFT path predates the verl RL path and uses the original Qwen3-8B + LoRA + TRL stack.
 
-Monitor training on [W&B](https://wandb.ai) — look for increasing mean reward (NSE) and bounded KL divergence.
-
-### 7. Evaluate All Models
+### 6. Evaluate
 
 ```bash
-# Baseline (raw Qwen3-8B)
-modal run modal_app/eval.py --model-id Qwen/Qwen3-8B
+# Baseline
+modal run modal_app/eval.py --model-id Qwen/Qwen3-4B-Instruct-2507
 
-# Experiment: SFT model
-modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydro-distill
-
-# Experiment: RL model
-modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydroLLM
+# RL-trained checkpoint
+modal run modal_app/eval.py --model-id <your_hf_repo_or_local_volume_path>
 ```
 
 Results are tagged as `baseline` or `experiment` and saved to the `hydrollm-results` Modal Volume.
@@ -205,25 +224,23 @@ docker run hydrollm-test python3 scripts/test_env_local.py
 
 ## Configuration
 
-### Training Hyperparameters (`configs/train_config.yaml`)
+### RL training (`configs/verl/qwen3_4b_grpo.yaml`)
 
-| Parameter | Default | Description |
+Hydra overlay on top of verl's `ppo_trainer` defaults. Key knobs:
+
+| Hydra key | Default | Description |
 |-----------|---------|-------------|
-| `num_generations` | 8 | Rollouts per prompt (K in GRPO) |
-| `max_completion_length` | 2048 | Max tokens per generation |
-| `kl_coef` | 0.05 | KL divergence penalty |
-| `num_train_epochs` | 30 | Training epochs |
-| `max_turns` | 10 | Max calibration rounds per rollout |
-| `ef5_timeout` | 120 | Seconds per EF5 simulation |
-
-### Model Config (`configs/models/qwen3_8b.yaml`)
-
-| Parameter | Value |
-|-----------|-------|
-| `lora_r` | 16 |
-| `lora_alpha` | 32 |
-| `learning_rate` | 5e-6 |
-| `gpu_mode` | colocate |
+| `algorithm.adv_estimator` | `grpo` | GRPO (group-relative advantages) |
+| `data.train_batch_size` | 8 | Prompts per step (×K=8 rollouts) |
+| `actor_rollout_ref.rollout.n` | 8 | K rollouts per prompt |
+| `actor_rollout_ref.rollout.temperature` | 1.1 | Sampling temperature (>1 for exploration) |
+| `actor_rollout_ref.rollout.multi_turn.max_assistant_turns` | 10 | Max calibration rounds per rollout |
+| `actor_rollout_ref.actor.optim.lr` | 5e-6 | Actor learning rate |
+| `actor_rollout_ref.actor.kl_loss_coef` | 0.001 | KL penalty (low — leans on multi-turn variance) |
+| `data.max_response_length` | 4096 | Max tokens per assistant turn |
+| `trainer.total_epochs` | 30 | Training epochs |
+| `trainer.save_freq` | 50 | Checkpoint cadence (steps) |
+| `trainer.n_gpus_per_node` | 4 | GPUs (single Modal container) |
 
 ### Adding New Gages (Phase 2)
 
@@ -251,15 +268,27 @@ docker run hydrollm-test python3 scripts/test_env_local.py
 
 ## Reward Function
 
-The trajectory-level reward encourages calibration quality and efficiency:
+Two layers of signal: **per-turn** (returned by tools) and **terminal** (returned by `verl_reward.compute_score`):
+
+**Per-turn (in `src/hydrollm/verl_tools.py`):**
+
+| Tool call | Reward | Purpose |
+|-----------|--------|---------|
+| `set_parameters` (valid) | `+0.02` | Densify per-turn signal; reward protocol step |
+| `run_simulation` (valid) | `+0.05` | Slightly higher: produces the artifact to evaluate |
+| `evaluate` (valid) | `ΔNSE` | Real progress signal (this turn's NSE − previous) |
+| Any tool (invalid) | `−0.5` | Format penalty |
+
+Per-trajectory format-bonus is implicitly capped via `max_assistant_turns=10` (≈ +0.5 max).
+
+**Terminal (in `src/hydrollm/verl_reward.py`):**
 
 | Component | Value | Purpose |
 |-----------|-------|---------|
 | Best NSE | `[-1, 1]` | Primary signal (clipped) |
-| Target bonus | `+0.5` | Reward for NSE > 0.8075 |
-| Improvement bonus | `+0.2` | Reward for improving across turns |
-| Error penalty | `-0.5` | Per invalid tool call |
-| Efficiency penalty | `-0.02` | Per simulation run |
+| Target bonus | `+0.5` | NSE exceeds gage's `target_nse` |
+| Efficiency penalty | `-0.02` | Per evaluate call |
+| Empty-trajectory penalty | `-1.0` | No NSE produced at all |
 
 ## Tools
 
@@ -280,16 +309,17 @@ The model has access to three tools during calibration:
 - **vLLM V1 engine**: `VLLM_USE_V1=0` env var is not reliably respected. Both V0 and V1 trigger the SymInt crash.
 - **flash-attn**: Requires CUDA SDK (`CUDA_HOME`) installed in the container. Modal's base pytorch images don't include it. Workaround: use PyTorch's built-in SDPA (`attn_implementation="sdpa"`).
 
-### Memory Budget (1×H100, 80 GB)
+### Memory Budget (4×H100, 80 GB each, FSDP-sharded)
 
-| Component | Estimate |
-|-----------|----------|
-| Qwen3-8B BF16 weights | ~16 GB |
-| LoRA adapters | ~0.1 GB |
-| Optimizer states (AdamW) | ~0.4 GB |
-| Activations (gradient checkpointing) | ~8 GB |
-| KV cache (8 rollouts × 2048 tokens) | ~12 GB |
-| **Headroom** | **~43 GB** |
+| Component | Per GPU | Notes |
+|-----------|---------|-------|
+| Qwen3-4B BF16 weights | ~2 GB | 8 GB total / 4 shards |
+| Gradients (BF16) | ~2 GB | |
+| AdamW states (FP32, m+v) | ~8 GB | 32 GB total / 4 shards |
+| Activations (gradient checkpointing) | ~5 GB | depends on seq length |
+| SGLang KV cache (rollout) | ~12 GB | `gpu_memory_utilization: 0.55` |
+| **Total** | **~29 GB** | |
+| **Headroom** | **~50 GB** | |
 
 ## Roadmap
 
