@@ -134,7 +134,9 @@ HYDRO_TOOLS = [
                 "Execute the EF5/CREST simulation with the currently set parameters. "
                 "Runs the hydrologic model and produces an output CSV file with "
                 "simulated discharge time series. You must call set_parameters first. "
-                "After running simulation, call evaluate to compute metrics."
+                "This tool does NOT return any performance metrics — it only confirms "
+                "the simulation completed. You must call evaluate afterwards to see "
+                "NSE, KGE, correlation, peak magnitudes, and timing error."
             ),
             "parameters": {
                 "type": "object",
@@ -147,9 +149,12 @@ HYDRO_TOOLS = [
         "function": {
             "name": "evaluate",
             "description": (
-                "Calculate NSE (Nash-Sutcliffe Efficiency) from the most recent simulation output. "
-                "Loads the output CSV file and computes the NSE metric comparing simulated vs observed discharge. "
-                "Call this after run_simulation to get the NSE value for that simulation run."
+                "Compute a full metric suite from the most recent simulation output. "
+                "Returns NSE (Nash-Sutcliffe Efficiency), CC (Pearson correlation), "
+                "KGE (Kling-Gupta Efficiency), simulated and observed peak discharge, "
+                "the peak ratio (sim/obs), and the peak-timing lag in hours "
+                "(positive = simulation peaks late). Call this after run_simulation "
+                "— it is the only tool that exposes performance metrics."
             ),
             "parameters": {
                 "type": "object",

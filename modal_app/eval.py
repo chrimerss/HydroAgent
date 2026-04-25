@@ -46,6 +46,15 @@ def classify_model(model_id: str) -> str:
     return "experiment"
 
 
+# Keys surfaced from the evaluate tool back to the conversation. Only this
+# tool exposes performance metrics — run_simulation intentionally does not.
+_EVALUATE_METRIC_KEYS = (
+    "NSE", "CC", "KGE",
+    "sim_peak", "obs_peak", "peak_ratio",
+    "lag_hours_sim_minus_obs", "num_points",
+)
+
+
 def _compact_tool_result(tool_name: str, data: dict) -> str:
     """Return a short summary of tool output for the conversation context."""
     status = data.get("status", "error")
@@ -57,15 +66,20 @@ def _compact_tool_result(tool_name: str, data: dict) -> str:
         return json.dumps({"status": "ok", "params": params})
 
     if tool_name == "run_simulation":
-        return json.dumps({"status": "ok", "run": data.get("run_number")})
-
-    if tool_name == "evaluate":
+        # Intentionally metric-free: forces the agent to call evaluate when
+        # it wants to know how the run performed.
         return json.dumps({
             "status": "ok",
-            "nse": data.get("nse") or data.get("current_nse"),
-            "best_nse": data.get("best_nse"),
-            "target_met": data.get("target_met"),
+            "run": data.get("run_number"),
+            "message": "Simulation complete. Call evaluate to see metrics.",
         })
+
+    if tool_name == "evaluate":
+        payload = {"status": "ok"}
+        for key in _EVALUATE_METRIC_KEYS:
+            if key in data:
+                payload[key] = data[key]
+        return json.dumps(payload)
 
     return json.dumps({"status": status})
 
@@ -188,19 +202,48 @@ def run_inference(
             outputs = llm.generate(prompt, sampling_params)
             assistant_message = outputs[0].outputs[0].text
 
-            messages.append({"role": "assistant", "content": assistant_message})
-
             # Parse tool calls
             tool_calls = parse_tool_calls(assistant_message)
 
             if not tool_calls:
+                messages.append({"role": "assistant", "content": assistant_message})
                 logger.info("No tool calls in turn %d, ending conversation", turn + 1)
                 turn_details.append({
                     "turn": turn + 1,
                     "action": "no_tool_call",
-                    "response_preview": assistant_message[:200],
+                    "response_preview": assistant_message,
                 })
                 break
+
+            import uuid
+            import re
+            
+            # Extract reasoning by removing the tool call blocks
+            reasoning = re.sub(r"<tool_call>.*?</tool_call>", "", assistant_message, flags=re.DOTALL).strip()
+            
+            # If the model used the raw json format without <tool_call>, strip that too
+            json_pattern = r'\{"name"\s*:\s*"\w+"\s*,\s*"arguments"\s*:\s*\{.*?\}\}'
+            reasoning = re.sub(json_pattern, "", reasoning, flags=re.DOTALL).strip()
+
+            openai_tool_calls = []
+            for call in tool_calls:
+                call_id = f"call_{uuid.uuid4().hex[:8]}"
+                call["id"] = call_id
+                args_dict = call["arguments"] if isinstance(call["arguments"], dict) else json.loads(call["arguments"])
+                openai_tool_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": args_dict
+                    }
+                })
+
+            messages.append({
+                "role": "assistant",
+                "content": reasoning,
+                "tool_calls": openai_tool_calls
+            })
 
             # Execute each tool call
             for call in tool_calls:
@@ -221,15 +264,17 @@ def run_inference(
 
                 messages.append({
                     "role": "tool",
+                    "tool_call_id": call["id"],
                     "name": tool_name,
                     "content": _compact_tool_result(tool_name, result_data),
                 })
 
-                turn_details.append({
-                    "turn": turn + 1,
-                    "tool": tool_name,
-                    "nse": result_data.get("nse"),
-                })
+                turn_entry = {"turn": turn + 1, "tool": tool_name}
+                if tool_name == "evaluate" and result_data.get("status") == "ok":
+                    for key in _EVALUATE_METRIC_KEYS:
+                        if key in result_data:
+                            turn_entry[key] = result_data[key]
+                turn_details.append(turn_entry)
 
     finally:
         elapsed = time.time() - start_time

@@ -17,5 +17,12 @@ lora_target_modules:
   - "down_proj"
 
 # Training
-learning_rate: 2.0e-5
 grad_accum_steps: 8
+num_train_epochs: 1
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 2.0e-6
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+max_seq_length: 4096
+bf16: true

@@ -1,0 +1,91 @@
+# verl tool config — schemas exposed to the model + tool class registration.
+# Used via actor_rollout_ref.rollout.multi_turn.tool_config_path
+
+tools:
+  - class_name: hydrollm.verl_tools.SetParametersTool
+    config: {}
+    tool_schema:
+      type: function
+      function:
+        name: set_parameters
+        description: >
+          Set CREST hydrologic model parameter multipliers for calibration.
+          Each parameter scales a spatially distributed grid that represents a
+          physical property of the watershed. After setting parameters, you
+          must call run_simulation to execute the model.
+        parameters:
+          type: object
+          properties:
+            wm:
+              type: number
+              description: Soil water storage capacity multiplier [0.1, 10.0].
+            b:
+              type: number
+              description: Variable infiltration curve shape [0.000001, 3.0].
+            im:
+              type: number
+              description: Impervious area fraction [0.0, 1.0].
+            ke:
+              type: number
+              description: Evapotranspiration scaling factor [0.8, 1.2].
+            fc:
+              type: number
+              description: Saturated hydraulic conductivity multiplier [0.1, 2.0].
+            under:
+              type: number
+              description: Interflow velocity multiplier [0.1, 10.0].
+            leaki:
+              type: number
+              description: Interflow leakage rate multiplier [0.1, 10.0].
+            alpha:
+              type: number
+              description: Channel routing coefficient [0.1, 3.0] in Q = alpha * A^beta.
+            beta:
+              type: number
+              description: Channel routing exponent [0.1, 3.0].
+            alpha0:
+              type: number
+              description: Overland (non-channel) routing parameter [0.0, 3.0].
+            iwu:
+              type: number
+              description: Initial soil moisture [0.1, 100.0].
+          required:
+            - wm
+            - b
+            - im
+            - ke
+            - fc
+            - under
+            - leaki
+            - alpha
+            - beta
+            - alpha0
+            - iwu
+
+  - class_name: hydrollm.verl_tools.RunSimulationTool
+    config: {}
+    tool_schema:
+      type: function
+      function:
+        name: run_simulation
+        description: >
+          Execute the EF5/CREST simulation with the currently set parameters.
+          Produces an output CSV with simulated discharge. Does NOT return
+          metrics — call evaluate afterwards to see NSE, KGE, peaks, timing.
+        parameters:
+          type: object
+          properties: {}
+
+  - class_name: hydrollm.verl_tools.EvaluateTool
+    config: {}
+    tool_schema:
+      type: function
+      function:
+        name: evaluate
+        description: >
+          Compute NSE, CC, KGE, peak magnitudes and ratio, and peak-timing
+          lag from the most recent simulation output. This is the only tool
+          that exposes performance metrics.
+        parameters:
+          type: object
+          properties: {}

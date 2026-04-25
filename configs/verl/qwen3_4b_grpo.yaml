@@ -1,0 +1,99 @@
+# HydroLLM GRPO training overlay for verl.
+# Composed via `--config-path configs/verl --config-name qwen3_4b_grpo`
+# in modal_app/train.py. Pulls verl's ppo_trainer defaults and overrides
+# only what we need.
+
+hydra:
+  searchpath:
+    - file:///opt/verl/verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# Layered on top of verl's ppo_trainer defaults; we only override.
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  kl_penalty: kl
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.0
+
+data:
+  train_files:
+    - /workspace/data/verl/train.parquet
+  val_files:
+    - /workspace/data/verl/val.parquet
+  train_batch_size: 8
+  val_batch_size: 8
+  max_prompt_length: 2048
+  max_response_length: 4096
+  filter_overlong_prompts: true
+  truncation: error
+  shuffle: true
+  return_raw_chat: true
+
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen3-4B-Instruct-2507
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+    trust_remote_code: true
+    lora_rank: 16
+    lora_alpha: 32
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  actor:
+    optim:
+      lr: 5.0e-6
+      weight_decay: 0.0
+      lr_warmup_steps_ratio: 0.0
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 1
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0.0
+    grad_clip: 1.0
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+    log_prob_micro_batch_size_per_gpu: 1
+  rollout:
+    name: vllm
+    mode: sync
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.55
+    n: 8                       # K rollouts per prompt (GRPO group size)
+    temperature: 1.1           # >1 for exploration; lowers post-bootstrap
+    top_p: 0.95
+    max_num_batched_tokens: 8192
+    free_cache_engine: true
+    enforce_eager: true
+    log_prob_micro_batch_size_per_gpu: 1
+    multi_turn:
+      enable: true
+      max_assistant_turns: 10
+      tool_config_path: /workspace/configs/verl/tool_config.yaml
+      format: hermes
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+
+custom_reward_function:
+  path: /workspace/src/hydrollm/verl_reward.py
+  name: compute_score
+
+trainer:
+  project_name: hydrollm
+  experiment_name: qwen3-4b-grpo
+  logger: [console, wandb]
+  n_gpus_per_node: 4
+  nnodes: 1
+  save_freq: 50
+  test_freq: 25
+  total_epochs: 30
+  default_local_dir: /checkpoints/qwen3-4b-grpo
+  resume_mode: auto

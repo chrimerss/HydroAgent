@@ -5,8 +5,8 @@ model_id: "Qwen/Qwen3-8B"
 hf_repo_id: "chrimerss/Qwen-3-8B-hydro-distill"
 
 # LoRA configuration (same architecture as RL for compatibility)
-lora_r: 16
-lora_alpha: 32
+lora_r: 8
+lora_alpha: 16
 lora_target_modules:
   - "q_proj"
   - "k_proj"

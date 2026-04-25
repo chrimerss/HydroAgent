@@ -54,4 +54,6 @@ results/
 *.log
 
 CLAUDE.md
+MISTAKE.md
+PROGRESS.md
 *.json

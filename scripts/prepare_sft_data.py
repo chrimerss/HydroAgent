@@ -294,8 +294,9 @@ def convert_calibration_to_conversations(
 ) -> list[dict]:
     """Convert a single calibration history to list of conversation dicts.
 
-    Each conversation covers the full multi-round calibration trajectory,
-    including ALL candidates per round.
+    Creates multi-turn sequential data using a sliding window approach.
+    For each candidate at round N, the context includes the best candidates
+    from rounds 0 to N-1, and then the current candidate as the N-th turn.
 
     Returns a list of conversation dicts, each with:
         - messages: list of {role, content} dicts
@@ -308,9 +309,9 @@ def convert_calibration_to_conversations(
 
     conversations = []
 
-    # Strategy: create one conversation per round, showing all candidates
-    # This gives the model exposure to multiple parameter proposals and
-    # their outcomes within each calibration round
+    # History of messages from the best candidate of each previous round
+    history_messages = []
+    # History of NSEs from the best candidate of each previous round
     nse_history_global = []
 
     for round_data in rounds:
@@ -320,23 +321,19 @@ def convert_calibration_to_conversations(
         if not candidates:
             continue
 
+        round_turns = []
+
         for cand in candidates:
             cand_idx = cand.get("candidate_index", 0)
             params = cand.get("params", {})
             if not params:
                 continue
 
-            # Build a single-trajectory conversation for this candidate
-            messages = []
+            # Build the current candidate's turn
+            turn_messages = []
 
-            # System prompt
-            messages.append({"role": "system", "content": SYSTEM_PROMPT})
-
-            # User prompt
-            messages.append({"role": "user", "content": build_user_prompt(gage_id)})
-
-            # If we have prior rounds' best result, include context
-            is_first = (round_idx <= 1 and cand_idx == 0)
+            # If we have no prior rounds' best result, this is the first turn
+            is_first = (len(nse_history_global) == 0)
 
             # Assistant reasoning + tool call
             reasoning = synthesize_reasoning(
@@ -347,7 +344,7 @@ def convert_calibration_to_conversations(
             tool_args = build_set_parameters_args(params)
             tool_call_text = build_tool_call("set_parameters", tool_args)
 
-            messages.append({
+            turn_messages.append({
                 "role": "assistant",
                 "content": f"{reasoning}\n\n{tool_call_text}",
             })
@@ -355,7 +352,7 @@ def convert_calibration_to_conversations(
             # Tool result: set_parameters response
             validated_params = {k: round(v, 6) for k, v in params.items()
                                if k in PARAMETER_RANGES}
-            messages.append({
+            turn_messages.append({
                 "role": "tool",
                 "name": "set_parameters",
                 "content": json.dumps({
@@ -365,7 +362,7 @@ def convert_calibration_to_conversations(
             })
 
             # Assistant calls run_simulation
-            messages.append({
+            turn_messages.append({
                 "role": "assistant",
                 "content": f"Parameters set. Running EF5/CREST simulation...\n\n"
                            f"{build_tool_call('run_simulation', {})}",
@@ -373,7 +370,7 @@ def convert_calibration_to_conversations(
 
             # Tool result: simulation results
             sim_result = build_sim_result(cand)
-            messages.append({
+            turn_messages.append({
                 "role": "tool",
                 "name": "run_simulation",
                 "content": json.dumps(sim_result),
@@ -385,7 +382,7 @@ def convert_calibration_to_conversations(
 
             # Assistant analysis
             analysis = synthesize_analysis(cand, local_nse_history)
-            messages.append({
+            turn_messages.append({
                 "role": "assistant",
                 "content": analysis,
             })
@@ -394,18 +391,22 @@ def convert_calibration_to_conversations(
             eval_result = build_eval_result(
                 local_nse_history, params
             )
-            messages.append({
+            turn_messages.append({
                 "role": "assistant",
                 "content": f"Let me check the overall calibration progress.\n\n"
                            f"{build_tool_call('evaluate', {})}",
             })
-            messages.append({
+            turn_messages.append({
                 "role": "tool",
                 "name": "evaluate",
                 "content": json.dumps(eval_result),
             })
 
-            # Final assistant summary
+            # Save the raw turn (without final summary) for potential history continuation
+            round_turns.append((turn_messages, cand_nse))
+
+            # Final assistant summary only at the very end of this sliding window
+            final_turn_messages = list(turn_messages)
             if cand_nse > 0.8075:
                 final_msg = (
                     f"Calibration target achieved! Best NSE = {cand_nse:.4f} "
@@ -424,7 +425,15 @@ def convert_calibration_to_conversations(
                     f"Need to revisit the parameter strategy — "
                     f"consider adjusting the process that dominates the error."
                 )
-            messages.append({"role": "assistant", "content": final_msg})
+            final_turn_messages.append({"role": "assistant", "content": final_msg})
+
+            # Now build the full conversation:
+            # System prompt -> User prompt -> history_messages -> final_turn_messages
+            messages = []
+            messages.append({"role": "system", "content": SYSTEM_PROMPT})
+            messages.append({"role": "user", "content": build_user_prompt(gage_id)})
+            messages.extend(history_messages)
+            messages.extend(final_turn_messages)
 
             # Compute quality weight
             # Scale: NSE in [-1, 1] → weight in [0.1, 1.0]
@@ -443,11 +452,15 @@ def convert_calibration_to_conversations(
                 },
             })
 
-        # Update global NSE history with best candidate from this round
-        best_idx = round_data.get("best_candidate_index", 0)
-        if best_idx < len(candidates):
-            best_cand = candidates[best_idx]
-            best_cand_nse = best_cand.get("full_metrics", best_cand.get("metrics", {})).get("NSE", -1.0)
+        # Update history with the best candidate's turn from this round
+        if round_turns:
+            best_idx = round_data.get("best_candidate_index", 0)
+            if best_idx < len(round_turns):
+                best_turn_messages, best_cand_nse = round_turns[best_idx]
+            else:
+                best_turn_messages, best_cand_nse = round_turns[-1]
+            
+            history_messages.extend(best_turn_messages)
             nse_history_global.append(best_cand_nse)
 
     return conversations

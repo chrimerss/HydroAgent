@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import modal
 
-from modal_app.images import train_image
+from modal_app.images import sft_image as train_image
 
 app = modal.App("hydrollm-sft")
 
@@ -26,7 +26,7 @@ checkpoint_vol = modal.Volume.from_name("hydrollm-checkpoints", create_if_missin
 
 @app.function(
     image=train_image,
-    gpu="H100:1",
+    gpu="H100:4",
     timeout=28800,  # 8 hours max
     volumes={"/checkpoints": checkpoint_vol},
     secrets=[
@@ -36,6 +36,51 @@ checkpoint_vol = modal.Volume.from_name("hydrollm-checkpoints", create_if_missin
     memory=65536,  # 64 GiB system RAM
 )
 def train_sft(
+    model_config: str = "configs/models/qwen3_8b_sft.yaml",
+    sft_config: str = "configs/sft_config.yaml",
+    dry_run: bool = False,
+):
+    """Run SFT training. Launches DDP if multi-GPU is detected."""
+    import os
+    import torch
+
+    # Disable hf_transfer to prevent intermittent hanging during large file downloads
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
+    num_gpus = torch.cuda.device_count()
+    if num_gpus > 1 and "LOCAL_RANK" not in os.environ:
+        print(f"Detected {num_gpus} GPUs. Launching torchrun for DistributedDataParallel (DDP)...")
+        import subprocess
+        import sys
+
+        # Write a small runner script to execute _do_train via DDP
+        runner_script = f"""
+import sys
+import os
+sys.path.insert(0, '/root')
+from modal_app.sft import _do_train
+_do_train('{model_config}', '{sft_config}', {dry_run})
+"""
+        with open("/tmp/runner.py", "w") as f:
+            f.write(runner_script)
+
+        cmd = [
+            sys.executable, "-m", "torch.distributed.run",
+            f"--nproc_per_node={num_gpus}",
+            "/tmp/runner.py"
+        ]
+
+        result = subprocess.run(cmd, env=os.environ.copy(), check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"torchrun failed with exit code {result.returncode}")
+
+        return {"status": "ok", "mode": "ddp_multi_gpu", "model": model_config}
+
+    # Single GPU or already inside torchrun
+    return _do_train(model_config, sft_config, dry_run)
+
+
+def _do_train(
     model_config: str = "configs/models/qwen3_8b_sft.yaml",
     sft_config: str = "configs/sft_config.yaml",
     dry_run: bool = False,
@@ -53,6 +98,9 @@ def train_sft(
     import logging
     import os
     import yaml
+
+    # Disable hf_transfer to prevent intermittent hanging during large file downloads
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -134,7 +182,7 @@ def train_sft(
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
-    model.gradient_checkpointing_enable()
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     trainable, total = model.get_nb_trainable_parameters()
     logger.info("Trainable params: %s / %s (%.2f%%)",
@@ -159,6 +207,7 @@ def train_sft(
         report_to=scfg.get("report_to", "wandb") if not dry_run else "none",
         run_name=scfg.get("run_name", f"hydrollm-sft-{model_name}"),
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         # Dataset config
         dataset_text_field=None,  # We'll use the chat template formatting
     )
@@ -179,74 +228,79 @@ def train_sft(
         logger.info("DRY RUN complete — setup verified successfully!")
         return {"status": "dry_run_ok", "model": model_id}
 
-    # Save LoRA checkpoint
-    lora_dir = f"{output_dir}/lora_final"
-    logger.info("Saving LoRA checkpoint to %s", lora_dir)
-    trainer.save_model(lora_dir)
-    tokenizer.save_pretrained(lora_dir)
+    is_main_process = int(os.environ.get("LOCAL_RANK", "0")) == 0
 
-    # Merge LoRA into base model
-    logger.info("Merging LoRA weights into base model...")
-    merged_dir = f"{output_dir}/merged_final"
+    if is_main_process:
+        # Save LoRA checkpoint
+        lora_dir = f"{output_dir}/lora_final"
+        logger.info("Saving LoRA checkpoint to %s", lora_dir)
+        trainer.save_model(lora_dir)
+        tokenizer.save_pretrained(lora_dir)
 
-    from peft import PeftModel
+        # Merge LoRA into base model
+        logger.info("Merging LoRA weights into base model...")
+        merged_dir = f"{output_dir}/merged_final"
 
-    # Reload base model (fresh, unmodified)
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    )
+        from peft import PeftModel
 
-    # Load and merge LoRA
-    merged_model = PeftModel.from_pretrained(base_model, lora_dir)
-    merged_model = merged_model.merge_and_unload()
+        # Reload base model (fresh, unmodified)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
 
-    # Save merged model
-    merged_model.save_pretrained(merged_dir)
-    tokenizer.save_pretrained(merged_dir)
-    logger.info("Merged model saved to %s", merged_dir)
+        # Load and merge LoRA
+        merged_model = PeftModel.from_pretrained(base_model, lora_dir)
+        merged_model = merged_model.merge_and_unload()
 
-    # Fix tokenizer config bug on disk
-    import json
-    tok_conf_path = os.path.join(merged_dir, "tokenizer_config.json")
-    if os.path.exists(tok_conf_path):
-        with open(tok_conf_path, "r") as f:
-            tcfg = json.load(f)
-        if isinstance(tcfg.get("extra_special_tokens"), list):
-            tcfg["extra_special_tokens"] = {}
-            with open(tok_conf_path, "w") as f:
-                json.dump(tcfg, f, indent=2)
-            logger.info("Fixed tokenizer_config.json extra_special_tokens bug")
+        # Save merged model
+        merged_model.save_pretrained(merged_dir)
+        tokenizer.save_pretrained(merged_dir)
+        logger.info("Merged model saved to %s", merged_dir)
 
-    # Push to HuggingFace
-    if hf_repo_id:
-        logger.info("Pushing merged model to HuggingFace: %s", hf_repo_id)
-        try:
-            from huggingface_hub import HfApi
-            api = HfApi()
-            api.create_repo(hf_repo_id, exist_ok=True)
-            api.upload_folder(
-                folder_path=merged_dir,
-                repo_id=hf_repo_id,
-                commit_message="SFT distillation from GPT-4o calibration trajectories",
-            )
-            logger.info("✓ Model pushed to https://huggingface.co/%s", hf_repo_id)
-        except Exception as e:
-            logger.error("Push to HuggingFace failed: %s", e)
-            logger.info("Model is saved locally at %s — push manually later", merged_dir)
+        # Fix tokenizer config bug on disk
+        import json
+        tok_conf_path = os.path.join(merged_dir, "tokenizer_config.json")
+        if os.path.exists(tok_conf_path):
+            with open(tok_conf_path, "r") as f:
+                tcfg = json.load(f)
+            if isinstance(tcfg.get("extra_special_tokens"), list):
+                tcfg["extra_special_tokens"] = {}
+                with open(tok_conf_path, "w") as f:
+                    json.dump(tcfg, f, indent=2)
+                logger.info("Fixed tokenizer_config.json extra_special_tokens bug")
 
-    # Persist volume
-    checkpoint_vol.commit()
-    logger.info("SFT training complete!")
+        # Push to HuggingFace
+        if hf_repo_id:
+            logger.info("Pushing merged model to HuggingFace: %s", hf_repo_id)
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi()
+                api.create_repo(hf_repo_id, exist_ok=True)
+                api.upload_folder(
+                    folder_path=merged_dir,
+                    repo_id=hf_repo_id,
+                    commit_message="SFT distillation from GPT-4o calibration trajectories",
+                )
+                logger.info("✓ Model pushed to https://huggingface.co/%s", hf_repo_id)
+            except Exception as e:
+                logger.error("Push to HuggingFace failed: %s", e)
+                logger.info("Model is saved locally at %s — push manually later", merged_dir)
 
-    return {
-        "status": "ok",
-        "model": model_id,
-        "hf_repo": hf_repo_id,
-        "output_dir": merged_dir,
-        "dataset_size": len(dataset),
-    }
+        # Persist volume
+        checkpoint_vol.commit()
+        logger.info("SFT training complete!")
+
+        return {
+            "status": "ok",
+            "model": model_id,
+            "hf_repo": hf_repo_id,
+            "output_dir": merged_dir,
+            "dataset_size": len(dataset),
+        }
+
+    return {"status": "ok", "mode": "ddp_worker"}
 
 
 @app.local_entrypoint()

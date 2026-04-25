@@ -186,106 +186,59 @@ class HydroEnvironment:
         return None
 
     def evaluate(self) -> dict:
-        """Calculate NSE from the most recent simulation output CSV.
+        """Compute a full metric suite from the most recent simulation.
 
-        Parses the EF5 output CSV to extract observed/simulated discharge,
-        then computes Nash-Sutcliffe Efficiency. Updates nse_history.
-
-        Returns:
-            dict with NSE value and status
+        Returns NSE, correlation coefficient (CC), Kling-Gupta Efficiency
+        (KGE), peak magnitudes and ratio, and the peak-timing lag (hours,
+        signed as sim - obs). The `run_simulation` tool intentionally does
+        NOT return any of these metrics — only this tool does, so the
+        agent must explicitly call evaluate to learn how well it is doing.
+        Updates nse_history with the computed NSE.
         """
         csv_path = self._find_output_csv()
         if csv_path is None:
-            logger.error("No output CSV found for NSE calculation")
-            return {"status": "error", "message": "No output CSV found", "nse": -1.0}
-
-        try:
-            obs, sim = self._parse_output_csv(csv_path)
-            if obs is None or sim is None:
-                self.nse_history.append(-999.0)
-                return {"status": "error", "message": "Failed to parse CSV or no valid data", "nse": -999.0}
-
-            nse = self._compute_nse(obs, sim)
-            self.nse_history.append(nse)
+            logger.error("No output CSV found for metric calculation")
             return {
-                "status": "ok",
-                "nse": round(nse, 4),
-                "message": f"NSE calculated from {len(obs)} data points",
-                "num_points": len(obs),
+                "status": "error",
+                "message": "No output CSV found",
+                "nse": -1.0,
             }
-        except Exception as e:
-            logger.error("Unexpected error in evaluate: %s", e)
-            self.nse_history.append(-999.0)
-            return {"status": "error", "message": f"Unexpected error: {e}", "nse": -999.0}
 
-    @staticmethod
-    def _compute_nse(obs: np.ndarray, sim: np.ndarray) -> float:
-        """Compute Nash-Sutcliffe Efficiency between observed and simulated."""
-        valid = ~(np.isnan(obs) | np.isnan(sim))
-        obs_c, sim_c = obs[valid], sim[valid]
-        if len(obs_c) == 0:
-            return -1.0
-        denom = np.sum((obs_c - np.mean(obs_c)) ** 2)
-        if denom == 0:
-            return 0.0
-        return float(1.0 - np.sum((obs_c - sim_c) ** 2) / denom)
-
-    @staticmethod
-    def _parse_output_csv(csv_path: Path) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Parse EF5 output CSV and extract observed/simulated discharge arrays."""
-        obs_values: list[float] = []
-        sim_values: list[float] = []
         try:
-            with open(csv_path, "r") as f:
-                reader = csv.DictReader(f)
-                fieldnames = reader.fieldnames or []
-                logger.info("CSV columns: %s", fieldnames)
-
-                obs_col = next(
-                    (c for c in fieldnames if "observed" in c.lower() or "obs" in c.lower()),
-                    None,
-                )
-                sim_col = next(
-                    (c for c in fieldnames
-                     if ("discharge" in c.lower() or "sim" in c.lower())
-                     and "observed" not in c.lower()),
-                    None,
-                )
-
-                if obs_col is None or sim_col is None:
-                    logger.error("Cannot identify obs/sim columns. Available: %s", fieldnames)
-                    return None, None
-
-                logger.info("Using columns: obs='%s', sim='%s'", obs_col, sim_col)
-                total_rows = 0
-                skipped_nodata = 0
-                for row in reader:
-                    total_rows += 1
-                    try:
-                        ov = float(row[obs_col]) if row[obs_col] else float("nan")
-                        sv = float(row[sim_col]) if row[sim_col] else float("nan")
-                        if np.isnan(ov) or np.isnan(sv) or ov <= -999 or sv <= -999:
-                            skipped_nodata += 1
-                            if total_rows <= 3:
-                                logger.info("Row %d skipped: obs=%s sim=%s", total_rows, ov, sv)
-                            continue
-                        obs_values.append(ov)
-                        sim_values.append(sv)
-                    except (ValueError, KeyError):
-                        skipped_nodata += 1
-                        continue
-
-            if not obs_values:
-                logger.warning(
-                    "No valid data in %s (%d rows, %d skipped as nodata/invalid)",
-                    csv_path, total_rows, skipped_nodata,
-                )
-                return None, None
-            logger.info("Parsed %d valid rows from %d total", len(obs_values), total_rows)
-            return np.array(obs_values), np.array(sim_values)
+            metrics = compute_metrics(csv_path)
         except Exception as e:
-            logger.error("Error reading CSV %s: %s", csv_path, e)
-            return None, None
+            logger.error("Unexpected error computing metrics: %s", e)
+            self.nse_history.append(-999.0)
+            return {
+                "status": "error",
+                "message": f"Unexpected error computing metrics: {e}",
+                "nse": -999.0,
+            }
+
+        if metrics is None:
+            self.nse_history.append(-999.0)
+            return {
+                "status": "error",
+                "message": "Failed to parse CSV or no valid data",
+                "nse": -999.0,
+            }
+
+        nse_value = metrics["NSE"]
+        # Keep the history numeric so max() calls downstream stay valid.
+        self.nse_history.append(
+            -999.0 if (nse_value is None or np.isnan(nse_value)) else float(nse_value)
+        )
+
+        # Round floats for a compact tool response; leave num_points as int.
+        rounded = {
+            k: (int(v) if k == "num_points" else _round_metric(v))
+            for k, v in metrics.items()
+        }
+        return {
+            "status": "ok",
+            "message": f"Metrics calculated from {metrics['num_points']} data points",
+            **rounded,
+        }
 
     def _validate_and_clamp(self, params: dict[str, float]) -> dict[str, float]:
         """Validate parameter names and clamp values to valid ranges."""
@@ -446,134 +399,160 @@ TIME_END={g.time_end}
 TASK=Simu
 """
 
-    # Missing-value sentinel used by EF5 for no-data observations
-    _NODATA_THRESHOLD = -998.0
-
-    def _parse_output(self) -> Optional[dict[str, np.ndarray]]:
-        """Parse the EF5 output CSV to extract observed and simulated timeseries.
-
-        Filters out rows where either the observation or simulation value
-        is NaN or a missing-data sentinel (≤ -999).
-        """
-        # Look for output file: ts.{gage_id}.crest.csv
-        output_pattern = f"ts.{self.gage.gage_id}.crest.csv"
-        output_file = self.output_dir / output_pattern
-
-        if not output_file.exists():
-            # Try alternative patterns
-            candidates = list(self.output_dir.glob(f"ts.{self.gage.gage_id}*.csv"))
-            if not candidates:
-                logger.warning("No output file found matching %s", output_pattern)
-                return None
-            output_file = candidates[0]
-
-        try:
-            obs_values = []
-            sim_values = []
-            skipped = 0
-            skip_reasons = {"obs_nan": 0, "sim_nan": 0, "obs_nodata": 0, "sim_nodata": 0}
-            first_rows_logged = False
-            with open(output_file) as f:
-                reader = csv.DictReader(f)
-                # Log column headers
-                logger.info("CSV columns: %s", reader.fieldnames)
-                for row_idx, row in enumerate(reader):
-                    # Column names from EF5 output
-                    obs_col = None
-                    sim_col = None
-                    for col in row:
-                        if "observed" in col.lower():
-                            obs_col = col
-                        if "discharge" in col.lower() and "observed" not in col.lower():
-                            sim_col = col
-
-                    # Log first 3 rows for diagnosis
-                    if row_idx < 3:
-                        logger.info(
-                            "Row %d: obs_col=%s val=%s, sim_col=%s val=%s",
-                            row_idx,
-                            obs_col, row.get(obs_col, "N/A") if obs_col else "NO_COL",
-                            sim_col, row.get(sim_col, "N/A") if sim_col else "NO_COL",
-                        )
-
-                    if obs_col and sim_col:
-                        try:
-                            obs_val = float(row[obs_col])
-                            sim_val = float(row[sim_col])
-                        except (ValueError, TypeError):
-                            skipped += 1
-                            continue
-
-                        # Filter out missing values: EF5 uses -999 as nodata,
-                        # and NaN can also appear in model output
-                        if np.isnan(obs_val):
-                            skip_reasons["obs_nan"] += 1
-                            skipped += 1
-                            continue
-                        if np.isnan(sim_val):
-                            skip_reasons["sim_nan"] += 1
-                            skipped += 1
-                            continue
-                        if obs_val <= self._NODATA_THRESHOLD:
-                            skip_reasons["obs_nodata"] += 1
-                            skipped += 1
-                            continue
-                        if sim_val <= self._NODATA_THRESHOLD:
-                            skip_reasons["sim_nodata"] += 1
-                            skipped += 1
-                            continue
-
-                        obs_values.append(obs_val)
-                        sim_values.append(sim_val)
-
-            if skipped > 0:
-                logger.info(
-                    "Skipped %d rows in %s — reasons: %s",
-                    skipped, output_file.name, skip_reasons,
-                )
-
-            if not obs_values:
-                logger.warning("No valid data rows in %s", output_file)
-                return None
-
-            return {
-                "obs": np.array(obs_values),
-                "sim": np.array(sim_values),
-            }
-        except Exception as e:
-            logger.error("Error parsing %s: %s", output_file, e)
-            return None
-
     @staticmethod
     def _compute_nse(obs: np.ndarray, sim: np.ndarray) -> float:
-        """Compute Nash-Sutcliffe Efficiency.
-
-        NSE = 1 - sum((obs - sim)²) / sum((obs - mean(obs))²)
-
-        Handles residual NaN values by masking them out.
-        """
-        # Mask out any remaining NaN values
+        """Compute Nash-Sutcliffe Efficiency (kept for unit tests)."""
         valid = ~(np.isnan(obs) | np.isnan(sim))
-        obs = obs[valid]
-        sim = sim[valid]
-
-        if len(obs) == 0:
-            logger.warning("No valid obs/sim pairs for NSE computation")
+        obs_c, sim_c = obs[valid], sim[valid]
+        if len(obs_c) == 0:
             return -1.0
-
-        obs_mean = np.mean(obs)
-        denominator = np.sum((obs - obs_mean) ** 2)
-        if denominator == 0:
+        denom = np.sum((obs_c - np.mean(obs_c)) ** 2)
+        if denom == 0:
             return 0.0
-        numerator = np.sum((obs - sim) ** 2)
-        return float(1.0 - numerator / denominator)
+        return float(1.0 - np.sum((obs_c - sim_c) ** 2) / denom)
 
     @staticmethod
     def _peak_timing_error(obs: np.ndarray, sim: np.ndarray) -> int:
-        """Compute peak timing error in hours (integer)."""
-        # Mask NaN for argmax
+        """Compute |obs_peak_idx - sim_peak_idx| (kept for unit tests)."""
         obs_clean = np.where(np.isnan(obs), -np.inf, obs)
         sim_clean = np.where(np.isnan(sim), -np.inf, sim)
-        obs_peak_idx = int(np.argmax(obs_clean))
-        sim_peak_idx = int(np.argmax(sim_clean))
-        return abs(obs_peak_idx - sim_peak_idx)
+        return abs(int(np.argmax(obs_clean)) - int(np.argmax(sim_clean)))
+
+
+# ---------------------------------------------------------------------------
+# Module-level metric helpers
+# ---------------------------------------------------------------------------
+
+# EF5 uses -999 as the observation missing-value sentinel.
+_NODATA_THRESHOLD = -998.0
+
+
+def _safe_corrcoef(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation that returns NaN rather than raising on zero variance."""
+    if len(a) < 2 or np.std(a) == 0 or np.std(b) == 0:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _kge(sim: np.ndarray, obs: np.ndarray) -> float:
+    """Kling-Gupta Efficiency, KGE = 1 - sqrt((r-1)^2 + (a-1)^2 + (b-1)^2)."""
+    if len(obs) < 2:
+        return float("nan")
+    obs_mean = float(np.mean(obs))
+    obs_std = float(np.std(obs))
+    sim_std = float(np.std(sim))
+    if obs_std == 0 or obs_mean == 0:
+        return float("nan")
+    r = _safe_corrcoef(sim, obs)
+    if np.isnan(r):
+        return float("nan")
+    alpha = sim_std / obs_std
+    beta = float(np.mean(sim)) / obs_mean
+    return float(1.0 - np.sqrt((r - 1) ** 2 + (alpha - 1) ** 2 + (beta - 1) ** 2))
+
+
+def _round_metric(v: float) -> float:
+    """Round a metric to 4 dp, passing NaN/Inf through unchanged."""
+    if v is None:
+        return v
+    try:
+        if np.isnan(v) or np.isinf(v):
+            return float(v)
+    except TypeError:
+        return v
+    return round(float(v), 4)
+
+
+def _identify_columns(columns: list[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Pick (time, sim, obs) columns from an EF5 output CSV header."""
+    time_col = next(
+        (c for c in columns if c.lower() in {"time", "date", "datetime", "timestamp"}),
+        None,
+    )
+    if time_col is None:
+        time_col = next((c for c in columns if "time" in c.lower() or "date" in c.lower()), None)
+
+    obs_col = next((c for c in columns if "observed" in c.lower()), None)
+    if obs_col is None:
+        obs_col = next((c for c in columns if "obs" in c.lower()), None)
+
+    sim_col = next(
+        (c for c in columns
+         if ("discharge" in c.lower() or "sim" in c.lower())
+         and "observed" not in c.lower() and "obs" not in c.lower()),
+        None,
+    )
+    return time_col, sim_col, obs_col
+
+
+def compute_metrics(csv_path: Path) -> Optional[dict]:
+    """Compute NSE, CC, KGE, peak magnitudes/ratio, and peak-timing lag.
+
+    Reads the EF5 output CSV, identifies observation/simulation columns,
+    filters NaN and the -999 missing-value sentinel, and returns a dict
+    with every metric plus the number of valid points. Returns None if
+    the CSV cannot be parsed or contains no valid rows.
+    """
+    import pandas as pd
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        logger.error("Failed to read CSV %s: %s", csv_path, e)
+        return None
+
+    columns = list(df.columns)
+    time_col, sim_col, obs_col = _identify_columns(columns)
+    if sim_col is None or obs_col is None:
+        logger.error("Cannot identify obs/sim columns. Available: %s", columns)
+        return None
+    logger.info("Using columns: time='%s', sim='%s', obs='%s'", time_col, sim_col, obs_col)
+
+    s = pd.to_numeric(df[sim_col], errors="coerce")
+    o = pd.to_numeric(df[obs_col], errors="coerce")
+    valid = ~(s.isna() | o.isna()) & (s > _NODATA_THRESHOLD) & (o > _NODATA_THRESHOLD)
+
+    s = s[valid].to_numpy(dtype=float)
+    o = o[valid].to_numpy(dtype=float)
+    if s.size == 0:
+        logger.warning("No valid obs/sim rows in %s", csv_path)
+        return None
+
+    # Time series for peak-timing lag; falls back to integer index if the
+    # time column is missing or not parseable.
+    if time_col is not None:
+        t = pd.to_datetime(df[time_col], errors="coerce")[valid]
+        if t.isna().any():
+            t = None
+    else:
+        t = None
+
+    obs_mean = float(np.mean(o))
+    denom = float(np.sum((o - obs_mean) ** 2))
+    nse = float(1.0 - np.sum((o - s) ** 2) / denom) if denom > 0 else float("nan")
+
+    cc = _safe_corrcoef(s, o)
+    kge_val = _kge(s, o)
+
+    s_peak = float(np.max(s))
+    o_peak = float(np.max(o))
+    peak_ratio = float(s_peak / o_peak) if o_peak > 0 else float("inf")
+
+    s_idx = int(np.argmax(s))
+    o_idx = int(np.argmax(o))
+    if t is not None:
+        lag_hours = float((t.iloc[s_idx] - t.iloc[o_idx]).total_seconds() / 3600.0)
+    else:
+        # Assume 1h timestep (EF5 default) when no timestamp column is present.
+        lag_hours = float(s_idx - o_idx)
+
+    return {
+        "NSE": nse,
+        "CC": cc,
+        "KGE": kge_val,
+        "sim_peak": s_peak,
+        "obs_peak": o_peak,
+        "peak_ratio": peak_ratio,
+        "lag_hours_sim_minus_obs": lag_hours,
+        "num_points": int(s.size),
+    }

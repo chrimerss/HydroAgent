@@ -37,26 +37,8 @@ def load_sft_dataset(
             messages = data["messages"]
             metadata = data.get("metadata", {})
 
-            # Clean messages: ensure tool role messages have proper format
-            cleaned = []
-            for msg in messages:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-
-                if role == "tool":
-                    # TRL SFTTrainer expects tool results as regular messages
-                    # Include tool name in content for context
-                    tool_name = msg.get("name", "unknown")
-                    cleaned.append({
-                        "role": "tool",
-                        "content": content,
-                        "name": tool_name,
-                    })
-                else:
-                    cleaned.append({
-                        "role": role,
-                        "content": content,
-                    })
+            # Messages are already in standard OpenAI format with tool_calls
+            cleaned = messages
 
             examples.append({
                 "messages": cleaned,
