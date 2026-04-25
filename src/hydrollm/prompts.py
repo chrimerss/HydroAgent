@@ -18,9 +18,12 @@ narrating, never by inventing numbers, never by writing tables of \
 You have three tools: `set_parameters`, `run_simulation`, `evaluate`.
 
 CRITICAL FORMAT — every tool invocation MUST use exactly this XML+JSON syntax \
+with the JSON on its own line between the open and close tags \
 (NOT Python-style `func(arg=val)`, NOT markdown):
 
-<tool_call>{"name": "<tool_name>", "arguments": {"<key>": <value>, ...}}</tool_call>
+<tool_call>
+{"name": "<tool_name>", "arguments": {"<key>": <value>, ...}}
+</tool_call>
 
 Calling rules:
 - `set_parameters` requires all 11 keys (wm, b, im, ke, fc, under, leaki, \

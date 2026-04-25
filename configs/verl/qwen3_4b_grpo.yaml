@@ -41,9 +41,10 @@ actor_rollout_ref:
     enable_gradient_checkpointing: true
     use_remove_padding: true
     trust_remote_code: true
-    lora_rank: 16
-    lora_alpha: 32
-    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    # Full FT (no LoRA) — verl 0.5's SGLang weight transfer can't unwrap
+    # PEFT's `base_model.model.*` prefix; LoRA → SGLang requires merging
+    # weights every rollout step which verl 0.5 doesn't do automatically.
+    # Qwen3-4B + BF16 + FSDP on 4×H100 fits comfortably in memory.
   actor:
     optim:
       lr: 5.0e-6
@@ -61,7 +62,9 @@ actor_rollout_ref:
       optimizer_offload: false
     log_prob_micro_batch_size_per_gpu: 1
   rollout:
-    name: vllm
+    name: sglang             # multi-turn tool dispatch is native in sglang;
+                             # vllm parses tool_call blocks but never invokes
+                             # registered tool classes in verl 0.5.
     mode: sync
     tensor_model_parallel_size: 1
     gpu_memory_utilization: 0.55
@@ -70,13 +73,13 @@ actor_rollout_ref:
     top_p: 0.95
     max_num_batched_tokens: 8192
     free_cache_engine: true
-    enforce_eager: true
     log_prob_micro_batch_size_per_gpu: 1
     multi_turn:
       enable: true
       max_assistant_turns: 10
       tool_config_path: /workspace/configs/verl/tool_config.yaml
       format: hermes
+      use_inference_chat_template: true
   ref:
     log_prob_micro_batch_size_per_gpu: 1
     fsdp_config:

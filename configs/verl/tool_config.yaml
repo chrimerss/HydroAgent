@@ -3,7 +3,8 @@
 
 tools:
   - class_name: hydrollm.verl_tools.SetParametersTool
-    config: {}
+    config:
+      type: native
     tool_schema:
       type: function
       function:
@@ -63,7 +64,8 @@ tools:
             - iwu
 
   - class_name: hydrollm.verl_tools.RunSimulationTool
-    config: {}
+    config:
+      type: native
     tool_schema:
       type: function
       function:
@@ -75,9 +77,11 @@ tools:
         parameters:
           type: object
           properties: {}
+          required: []
 
   - class_name: hydrollm.verl_tools.EvaluateTool
-    config: {}
+    config:
+      type: native
     tool_schema:
       type: function
       function:
@@ -89,3 +93,4 @@ tools:
         parameters:
           type: object
           properties: {}
+          required: []

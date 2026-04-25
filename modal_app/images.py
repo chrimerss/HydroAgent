@@ -17,7 +17,11 @@ import modal
 
 train_image = (
     modal.Image.from_registry(
-        "verlai/verl:app-verl0.5-vllm0.10.0-mcore0.13.0-te2.2",
+        # SGLang variant of the verl app image — has native multi-turn tool
+        # dispatch (which the vllm variant lacks in verl 0.5).
+        # 0.4.9.post6 is too new for verl 0.5 (`maybe_set_triton_cache_manager`
+        # was removed); 0.4.8 still has it.
+        "verlai/verl:app-verl0.5-sglang0.4.8-mcore0.13.0-te2.2",
     )
     .apt_install(
         "git", "gcc", "g++", "build-essential", "make",
