@@ -31,14 +31,18 @@ data_vol = modal.Volume.from_name("hydrollm-data", create_if_missing=True)
 @app.function(
     image=train_image,
     gpu="H100:4",
-    timeout=28800,  # 8h
+    timeout=86400,  # 24h (Modal max). Each GRPO step is ~30min with K=8 ×
+                    # max_turns=50; without bumping this, the function gets
+                    # killed before save_freq=10 emits the first checkpoint.
     volumes={"/checkpoints": checkpoint_vol, "/data_vol": data_vol},
     secrets=[
         modal.Secret.from_name("wandb"),
         modal.Secret.from_name("huggingface"),
     ],
     memory=131072,  # 128 GiB
-    cpu=16.0,
+    # 64 CPUs: K=8 rollouts × train_batch=8 = 64 simultaneous EF5 processes;
+    # each EF5 sim is CPU-bound, so undersubscribing CPUs causes 300s+ timeouts.
+    cpu=64.0,
 )
 def train(
     config_name: str = "qwen3_4b_grpo",

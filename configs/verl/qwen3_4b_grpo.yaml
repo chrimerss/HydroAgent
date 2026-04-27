@@ -26,8 +26,8 @@ data:
     - /workspace/data/verl/train.parquet
   val_files:
     - /workspace/data/verl/val.parquet
-  train_batch_size: 8
-  val_batch_size: 8
+  train_batch_size: 4
+  val_batch_size: 4
   max_prompt_length: 2048
   max_response_length: 4096
   filter_overlong_prompts: true
@@ -47,15 +47,20 @@ actor_rollout_ref:
     # Qwen3-4B + BF16 + FSDP on 4×H100 fits comfortably in memory.
   actor:
     optim:
-      lr: 5.0e-6
+      lr: 1.0e-6      # 5e-6 caused step-1 overshoot (pg_loss=-0.5) into a
+                      # degenerate policy that collapsed at step 2; smaller
+                      # lr gives gentler updates so the policy can stay diverse.
       weight_decay: 0.0
-      lr_warmup_steps_ratio: 0.0
-    ppo_mini_batch_size: 8
+      lr_warmup_steps_ratio: 0.05
+    ppo_mini_batch_size: 4
     ppo_micro_batch_size_per_gpu: 1
     use_kl_loss: true
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
-    entropy_coeff: 0.0
+    entropy_coeff: 0.05    # active exploration — 0.01 wasn't enough, GRPO
+                           # groups still collapsed at step 3 (launch12).
+                           # 0.05 keeps entropy from collapsing too fast on
+                           # this structured tool-call task.
     grad_clip: 1.0
     fsdp_config:
       param_offload: false
@@ -68,15 +73,18 @@ actor_rollout_ref:
     mode: sync
     tensor_model_parallel_size: 1
     gpu_memory_utilization: 0.55
-    n: 8                       # K rollouts per prompt (GRPO group size)
-    temperature: 1.1           # >1 for exploration; lowers post-bootstrap
-    top_p: 0.95
+    n: 6                       # K rollouts per prompt (GRPO group size).
+                               # 8 → 6 gives ~25% wall-time reduction with
+                               # only mild variance loss; below 4 hurts
+                               # GRPO advantage estimation.
+    temperature: 1.2           # >1 for exploration; lowers post-bootstrap
+    top_p: 0.97
     max_num_batched_tokens: 8192
     free_cache_engine: true
     log_prob_micro_batch_size_per_gpu: 1
     multi_turn:
       enable: true
-      max_assistant_turns: 10
+      max_assistant_turns: 50
       tool_config_path: /workspace/configs/verl/tool_config.yaml
       format: hermes
       use_inference_chat_template: true
@@ -95,7 +103,9 @@ trainer:
   logger: [console, wandb]
   n_gpus_per_node: 4
   nnodes: 1
-  save_freq: 50
+  save_freq: 10        # Each step ~30min wall time; checkpoint every 10
+                       # steps (~5h) so resume can recover from the 24h
+                       # Modal function timeout without losing >5h of work.
   test_freq: 25
   total_epochs: 30
   default_local_dir: /checkpoints/qwen3-4b-grpo

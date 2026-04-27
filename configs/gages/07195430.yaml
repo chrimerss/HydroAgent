@@ -1,0 +1,50 @@
+gage_id: 07195430
+lon: -94.5333333
+lat: 36.1086111
+basin_area: 1489.24
+obs_dir: /app/data/gauge
+control_template: /app/data/docs/control.txt
+time_begin: '201801040000'
+time_end: '201803042300'
+target_nse: 0.7
+ef5_timeout: 300
+parameter_ranges:
+  wm:
+  - 0.1
+  - 10.0
+  b:
+  - 1.0e-06
+  - 3.0
+  im:
+  - 0.0
+  - 1.0
+  ke:
+  - 0.8
+  - 1.2
+  fc:
+  - 0.1
+  - 2.0
+  under:
+  - 0.1
+  - 10.0
+  leaki:
+  - 0.1
+  - 10.0
+  alpha:
+  - 0.1
+  - 3.0
+  beta:
+  - 0.1
+  - 3.0
+  alpha0:
+  - 0.0
+  - 3.0
+  iwu:
+  - 0.1
+  - 100.0
+  th:
+  - 10
+  - 10
+  isu:
+  - 0
+  - 0

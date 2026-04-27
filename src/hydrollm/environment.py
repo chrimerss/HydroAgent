@@ -96,12 +96,16 @@ class HydroEnvironment:
             )
             if result.returncode != 0:
                 logger.warning(
-                    "EF5 exited with code %d: %s", result.returncode, result.stderr[:500]
+                    "[EF5_DIAG] gage=%s exit=%d run=%d duration_short_indicator=true",
+                    self.gage.gage_id, result.returncode, self.run_count,
                 )
+                logger.warning("[EF5_DIAG] stdout(last 2000): %s", (result.stdout or "")[-2000:])
+                logger.warning("[EF5_DIAG] stderr(last 2000): %s", (result.stderr or "")[-2000:])
+                self._log_sandbox_diagnostics()
                 return {
                     "status": "error",
                     "message": f"EF5 exited with code {result.returncode}",
-                    "stderr": result.stderr[:500],
+                    "stderr": (result.stderr or "")[:500],
                 }
 
             # Log EF5 output for diagnostics
@@ -119,6 +123,8 @@ class HydroEnvironment:
         # Verify output CSV was created
         output_csv = self._find_output_csv()
         if output_csv is None:
+            logger.warning("[EF5_DIAG] gage=%s no output CSV after exit=0", self.gage.gage_id)
+            self._log_sandbox_diagnostics()
             return {
                 "status": "error",
                 "message": "Simulation completed but no output CSV found",
@@ -130,6 +136,34 @@ class HydroEnvironment:
             "output_file": str(output_csv.name),
             "run_number": self.run_count,
         }
+
+    def _log_sandbox_diagnostics(self) -> None:
+        """One-shot dump: control file, MRMS LOC contents (head), OBS path check."""
+        try:
+            logger.warning("[EF5_DIAG] control_path=%s exists=%s",
+                           self.control_path, self.control_path.exists())
+            if self.control_path.exists():
+                txt = self.control_path.read_text()
+                # Only dump key lines
+                for line in txt.splitlines():
+                    up = line.strip().upper()
+                    if any(up.startswith(k) for k in ("OBS=", "LOC=", "TIME_", "OUTPUT=", "[GAUGE")):
+                        logger.warning("[EF5_DIAG]   %s", line.strip())
+            mrms_loc = Path(f"/app/data/data_mrms_clip/{self.gage.gage_id}")
+            if mrms_loc.exists():
+                files = sorted(p.name for p in mrms_loc.iterdir())
+                logger.warning("[EF5_DIAG] mrms_loc=%s n_files=%d first=%s last=%s",
+                               mrms_loc, len(files), files[0] if files else None,
+                               files[-1] if files else None)
+            else:
+                logger.warning("[EF5_DIAG] mrms_loc=%s does not exist", mrms_loc)
+            obs_path = Path(self.gage.obs_dir) / self._obs_filename
+            logger.warning("[EF5_DIAG] obs_path=%s exists=%s", obs_path, obs_path.exists())
+            out_files = sorted(p.name for p in self.output_dir.iterdir()) if self.output_dir.exists() else []
+            logger.warning("[EF5_DIAG] sandbox_output_dir=%s files=%s",
+                           self.output_dir, out_files[:10])
+        except Exception:
+            logger.exception("[EF5_DIAG] failed to dump diagnostics")
     def cleanup(self):
         """Remove the sandbox directory."""
         shutil.rmtree(self.sandbox_dir, ignore_errors=True)
@@ -149,17 +183,23 @@ class HydroEnvironment:
     # ------------------------------------------------------------------
 
     def _find_obs_file(self) -> str:
-        """Discover the observation file in the gage data directory."""
+        """Discover the observation file in the gage data directory.
+
+        Filters by gage_id so a shared obs directory (one CSV per gage)
+        still resolves to the right file.
+        """
         obs_dir = Path(self.gage.obs_dir)
         if obs_dir.exists():
-            csv_files = list(obs_dir.glob("USGS*.csv"))
+            csv_files = list(obs_dir.glob(f"USGS_{self.gage.gage_id}*.csv"))
+            if not csv_files:
+                csv_files = list(obs_dir.glob(f"*{self.gage.gage_id}*.csv"))
             if csv_files:
                 logger.info("Found obs file: %s", csv_files[0])
                 return csv_files[0].name
-            logger.warning("obs_dir %s exists but contains no CSV files", obs_dir)
+            logger.warning("obs_dir %s has no CSV matching gage %s", obs_dir, self.gage.gage_id)
         else:
             logger.warning("obs_dir %s does not exist", obs_dir)
-        fallback = f"{self.gage.gage_id}_obs.csv"
+        fallback = f"USGS_{self.gage.gage_id}_1h_UTC.csv"
         logger.warning("Using fallback obs filename: %s", fallback)
         return fallback
 
@@ -263,19 +303,40 @@ class HydroEnvironment:
             content = self._generate_control_content()
         else:
             content = template_path.read_text()
+            content = self._substitute_gage_metadata(content)
             content = self._inject_parameters(content)
 
         # Fix paths for sandbox
         content = self._fix_output_path(content)
         content = self._fix_obs_filename(content)
 
-        # Log the OBS line for diagnosis
+        # Log the OBS / MRMS / TIME lines for diagnosis
         for line in content.splitlines():
-            if line.strip().upper().startswith("OBS="):
-                logger.info("Control file OBS path: %s", line.strip())
-                break
+            up = line.strip().upper()
+            if up.startswith("OBS=") or up.startswith("LOC=") or up.startswith("TIME_"):
+                logger.info("Control file: %s", line.strip())
 
         self.control_path.write_text(content)
+
+    def _substitute_gage_metadata(self, content: str) -> str:
+        """Substitute per-gage placeholders into the shared control template."""
+        g = self.gage
+        mrms_loc = f"/app/data/data_mrms_clip/{g.gage_id}/"
+        replacements = {
+            "GAUGE_ID": str(g.gage_id),
+            "GAUGE_LON": str(g.lon),
+            "GAUGE_LAT": str(g.lat),
+            "GAUGE_BASIN_AREA": str(g.basin_area),
+            "MRMS_LOC": mrms_loc,
+            "OBS_DIR": g.obs_dir.rstrip("/"),
+            "TIME_BEGIN_PLACEHOLDER": g.time_begin,
+            "TIME_END_PLACEHOLDER": g.time_end,
+        }
+        # Order matters: GAUGE_ID is a substring of GAUGE_LON/LAT/BASIN_AREA
+        # only if substituted naively. We replace longer keys first.
+        for key in sorted(replacements, key=len, reverse=True):
+            content = content.replace(key, replacements[key])
+        return content
 
     def _inject_parameters(self, content: str) -> str:
         """Inject current parameter values into control file content."""
@@ -504,7 +565,8 @@ def compute_metrics(csv_path: Path) -> Optional[dict]:
     columns = list(df.columns)
     time_col, sim_col, obs_col = _identify_columns(columns)
     if sim_col is None or obs_col is None:
-        logger.error("Cannot identify obs/sim columns. Available: %s", columns)
+        logger.error("[CSV_DIAG] %s: cannot id columns. available=%s nrows=%d head=%s",
+                     csv_path, columns, len(df), df.head(3).to_dict("records"))
         return None
     logger.info("Using columns: time='%s', sim='%s', obs='%s'", time_col, sim_col, obs_col)
 
@@ -512,11 +574,22 @@ def compute_metrics(csv_path: Path) -> Optional[dict]:
     o = pd.to_numeric(df[obs_col], errors="coerce")
     valid = ~(s.isna() | o.isna()) & (s > _NODATA_THRESHOLD) & (o > _NODATA_THRESHOLD)
 
-    s = s[valid].to_numpy(dtype=float)
-    o = o[valid].to_numpy(dtype=float)
-    if s.size == 0:
-        logger.warning("No valid obs/sim rows in %s", csv_path)
+    s_arr = s[valid].to_numpy(dtype=float)
+    o_arr = o[valid].to_numpy(dtype=float)
+    if s_arr.size == 0:
+        logger.warning(
+            "[CSV_DIAG] %s no valid rows. nrows=%d sim_nan=%d obs_nan=%d "
+            "sim_nodata=%d obs_nodata=%d sim_min=%s obs_min=%s columns=%s head=%s",
+            csv_path, len(df),
+            int(s.isna().sum()), int(o.isna().sum()),
+            int((s <= _NODATA_THRESHOLD).sum()),
+            int((o <= _NODATA_THRESHOLD).sum()),
+            None if s.dropna().empty else float(s.dropna().min()),
+            None if o.dropna().empty else float(o.dropna().min()),
+            columns, df.head(3).to_dict("records"),
+        )
         return None
+    s, o = s_arr, o_arr
 
     # Time series for peak-timing lag; falls back to integer index if the
     # time column is missing or not parseable.

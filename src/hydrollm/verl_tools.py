@@ -32,6 +32,21 @@ _INVALID_PENALTY = 0.5
 _REWARD_SET_PARAMS = 0.02   # densify per-turn signal: reward valid protocol step
 _REWARD_RUN_SIM = 0.05      # slightly higher: this is the costly artifact-producing call
 
+# Limit concurrent EF5 invocations PER PYTHON WORKER PROCESS. verl spawns
+# one worker per GPU, so the *system-wide* concurrency is
+# `_EF5_CONCURRENCY × num_workers`. With 4 workers × 8 = 32 system-wide,
+# each EF5 gets ~2 of the 64 vCPUs — MRMS files page-cache after the first
+# read across rollouts, so I/O contention stays low.
+_EF5_CONCURRENCY = 8
+_EF5_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _get_ef5_semaphore() -> asyncio.Semaphore:
+    global _EF5_SEMAPHORE
+    if _EF5_SEMAPHORE is None:
+        _EF5_SEMAPHORE = asyncio.Semaphore(_EF5_CONCURRENCY)
+    return _EF5_SEMAPHORE
+
 
 def _get_env(instance_id: str) -> HydroEnvironment | None:
     return _ENV_REGISTRY.get(instance_id)
@@ -165,8 +180,16 @@ class RunSimulationTool(_HydroToolBase):
                 {"invalid": True},
             )
         logger.warning("[HYDRO_TOOL] run_simulation instance=%s", instance_id)
-        result = await asyncio.to_thread(env.run_simulation)
+        async with _get_ef5_semaphore():
+            result = await asyncio.to_thread(env.run_simulation)
         invalid = result.get("status") != "ok"
+        if invalid:
+            logger.warning(
+                "[HYDRO_TOOL] run_simulation FAIL instance=%s gage=%s msg=%s stderr=%s",
+                instance_id, env.gage.gage_id,
+                result.get("message"), (result.get("stderr") or "")[:500],
+            )
+            _dump_sandbox_diagnostics(env)
         reward = -_INVALID_PENALTY if invalid else _REWARD_RUN_SIM
         return json.dumps(result), reward, {"invalid": invalid}
 
@@ -189,6 +212,12 @@ class EvaluateTool(_HydroToolBase):
             )
         logger.warning("[HYDRO_TOOL] evaluate instance=%s", instance_id)
         result = await asyncio.to_thread(env.evaluate)
+        if result.get("status") != "ok":
+            logger.warning(
+                "[HYDRO_TOOL] evaluate FAIL instance=%s gage=%s msg=%s",
+                instance_id, env.gage.gage_id, result.get("message"),
+            )
+            _dump_csv_diagnostics(env)
         nse = result.get("NSE")
         history = _NSE_REGISTRY.setdefault(instance_id, [])
         if isinstance(nse, (int, float)) and nse > -998:
@@ -206,6 +235,57 @@ class EvaluateTool(_HydroToolBase):
 # ---------------------------------------------------------------------------
 # Helpers for tests / orchestration
 # ---------------------------------------------------------------------------
+
+def _dump_sandbox_diagnostics(env: HydroEnvironment) -> None:
+    """Log control-file path, MRMS LOC contents, OBS path existence."""
+    from pathlib import Path
+    try:
+        gage_id = env.gage.gage_id
+        cp = env.control_path
+        logger.warning("[HYDRO_DIAG] control=%s exists=%s", cp, cp.exists())
+        if cp.exists():
+            for line in cp.read_text().splitlines():
+                up = line.strip().upper()
+                if any(up.startswith(k) for k in ("OBS=", "LOC=", "TIME_", "OUTPUT=", "[GAUGE")):
+                    logger.warning("[HYDRO_DIAG]   %s", line.strip())
+        mrms = Path(f"/app/data/data_mrms_clip/{gage_id}")
+        if mrms.exists():
+            files = sorted(p.name for p in mrms.iterdir())
+            logger.warning(
+                "[HYDRO_DIAG] mrms=%s n=%d first=%s last=%s",
+                mrms, len(files), files[0] if files else None, files[-1] if files else None,
+            )
+        else:
+            logger.warning("[HYDRO_DIAG] mrms=%s MISSING", mrms)
+        obs = Path(env.gage.obs_dir) / env._obs_filename
+        logger.warning("[HYDRO_DIAG] obs=%s exists=%s", obs, obs.exists())
+        if env.output_dir.exists():
+            outs = sorted(p.name for p in env.output_dir.iterdir())
+            logger.warning("[HYDRO_DIAG] sandbox_out=%s files=%s", env.output_dir, outs[:10])
+    except Exception as e:
+        logger.warning("[HYDRO_DIAG] dump failed: %s", e)
+
+
+def _dump_csv_diagnostics(env: HydroEnvironment) -> None:
+    """When evaluate fails, dump the EF5 output CSV header and first rows."""
+    try:
+        from pathlib import Path
+        out = env.output_dir
+        if out.exists():
+            outs = sorted(out.iterdir())
+            logger.warning("[HYDRO_DIAG] eval_fail sandbox_out=%s files=%s", out, [p.name for p in outs[:10]])
+            for p in outs:
+                if p.suffix == ".csv":
+                    head = p.read_text()[:1500]
+                    logger.warning("[HYDRO_DIAG] csv=%s head=\n%s", p.name, head)
+                    break
+        else:
+            logger.warning("[HYDRO_DIAG] eval_fail sandbox_out=%s MISSING", out)
+        # Also dump control file lines for context
+        _dump_sandbox_diagnostics(env)
+    except Exception as e:
+        logger.warning("[HYDRO_DIAG] csv dump failed: %s", e)
+
 
 def get_nse_history(instance_id: str) -> list[float]:
     """Read the NSE trajectory accumulated for a given rollout."""

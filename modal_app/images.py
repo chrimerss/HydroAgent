@@ -38,15 +38,6 @@ train_image = (
         " && sed -i 's/-Werror//g' Makefile"
         " && make -j$(nproc)",
     )
-    # Calibration data
-    .run_commands(
-        "wget -qO /tmp/data.tar.gz "
-        '"https://huggingface.co/datasets/chrimerss/hydro_cali_agent_example'
-        '/resolve/main/data.tar.gz"',
-        "mkdir -p /app/data && tar -xzf /tmp/data.tar.gz -C /app/data",
-        "rm /tmp/data.tar.gz",
-        "mkdir -p /app/results /app/data/docs",
-    )
     .env({
         "EF5_EXECUTABLE": "/EF5/bin/ef5",
         "PATH": "/EF5/bin:$PATH",
@@ -85,6 +76,23 @@ train_image = (
         "git clone --depth 1 --branch v0.5.0 https://github.com/volcengine/verl.git /opt/verl"
         " || git clone --depth 1 https://github.com/volcengine/verl.git /opt/verl",
         "pip install -e /opt/verl",
+    )
+    # Calibration data — placed AFTER flash-attn so cache-busts here don't
+    # invalidate the expensive flash-attn / verl layers above.
+    # Bump the SHA + cache-bust suffix when re-uploading data.tar.gz.
+    .run_commands(
+        "echo 'hf_dataset_commit=07d7d02f67eebe818c9a193dcd8044ded9350974 cleanup-v4-small-basins'",
+        "rm -rf /app/data /app/results",
+        "wget -qO /tmp/data.tar.gz "
+        '"https://huggingface.co/datasets/chrimerss/hydro_cali_agent_example'
+        '/resolve/07d7d02f67eebe818c9a193dcd8044ded9350974/data.tar.gz"',
+        "mkdir -p /app/data && tar -xzf /tmp/data.tar.gz -C /app/data",
+        # Strip macOS AppleDouble metadata files that get bundled when tar runs
+        # on macOS — EF5 tries to parse them as TIFs and hangs.
+        "find /app/data -name '._*' -delete",
+        "rm /tmp/data.tar.gz",
+        "mkdir -p /app/results /app/data/docs",
+        "ls -la /app/data && du -sh /app/data/*",
     )
     # Mount project at /workspace (matches PYTHONPATH above)
     .add_local_dir("src", remote_path="/workspace/src")

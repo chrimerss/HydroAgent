@@ -30,17 +30,18 @@ The SFT stage teaches the model calibration reasoning and tool usage from 73 exp
 
 ## Model
 
-Training uses **Qwen3-4B-Instruct-2507** with **full fine-tuning** in BF16 + FSDP across 4 H100 GPUs, served by SGLang during rollouts:
+Training uses **Qwen3-4B-Instruct-2507** with **full fine-tuning** in BF16 + FSDP across 8 H100 GPUs, served by SGLang during rollouts:
 
 | Setting | Value |
 |---------|-------|
 | Base model | `Qwen/Qwen3-4B-Instruct-2507` |
 | Precision | BF16 |
 | Tuning | Full FT (FSDP, no LoRA) |
-| GPU | 4×H100 (80 GB each) |
-| Attention | flash-attn 2 |
+| GPU | 4×H100 (80 GB each) — GPU is *not* the bottleneck (MFU ~0.20-0.25); 4 H100 is the cost-efficient choice over 8 |
+| Attention | flash-attn 2 (built from source on first image build) |
 | Rollout backend | SGLang (multi-turn tool dispatch) |
 | Training stack | verl 0.5 GRPO trainer |
+| EF5 concurrency | 32 simultaneous (per-worker semaphore × num workers) |
 
 **Why Qwen3-4B?** Qwen3-Instruct ships with native tool-calling (Hermes-style `<tool_call>` JSON) and the 4B variant is the largest model that runs comfortably with full FT + FSDP on 4×H100, leaving room for K=8 multi-turn rollouts in the rollout engine.
 
@@ -112,13 +113,18 @@ HydroLLM/
 ```bash
 pip install modal
 modal token new
-modal secret create wandb HF_TOKEN=...      # one-time
+modal secret create wandb WANDB_API_KEY=...    # one-time
 modal secret create huggingface HF_TOKEN=...
 
-modal run modal_app/train.py
+# Detached so the run survives your laptop closing / wifi drop:
+modal run --detach modal_app/train.py --n-repeat 32 --n-val-repeat 1
 ```
 
-That's it. The default path runs verl GRPO on `Qwen3-4B-Instruct-2507` for the gage at `configs/gages/02338660.yaml` on 4×H100. First image build is ~15 min (flash-attn compile); subsequent runs reuse cached layers.
+The default path runs verl GRPO on `Qwen3-4B-Instruct-2507` over **10 CONUS gages** (small/medium basins, ≤2401 km²) on 4×H100. First image build is ~15 min (flash-attn compile); subsequent runs reuse cached layers.
+
+**Use `--detach`** — each training step is ~15-30 minutes wall time (K=8 rollouts × up to 50 multi-turn EF5 calls). With `save_freq=10` and 24h Modal function timeout, the run auto-resumes (`resume_mode: auto`) across timeout cycles, so the only thing you need is internet briefly to launch.
+
+Watch live on the Modal dashboard URL printed at launch, or on W&B (project `hydrollm`). Look for: `pg_loss` non-zero (gradient flowing), `actor/entropy ≈ 0.30` (not collapsed), and `critic/score/mean` rising above the validation-step:0 baseline of `~-0.4`.
 
 ### Prerequisites
 
@@ -152,34 +158,53 @@ Results are saved to the `hydrollm-results` Modal Volume.
 
 ### 4. RL Training (verl GRPO + SGLang on 4×H100)
 
-The default config trains `Qwen3-4B-Instruct-2507` directly with multi-turn rollouts and an in-process EF5 tool:
+The default config trains `Qwen3-4B-Instruct-2507` directly with multi-turn rollouts and an in-process EF5 tool over 10 CONUS gages:
 
 ```bash
-modal run modal_app/train.py
+# Recommended — detached so the launch terminal can disconnect:
+modal run --detach modal_app/train.py --n-repeat 32 --n-val-repeat 1
 ```
 
 Override defaults via Hydra-style overrides (semicolon-separated):
 
 ```bash
-# Shorter run
-modal run modal_app/train.py --extra-overrides "trainer.total_epochs=10"
-
-# Larger train batch
-modal run modal_app/train.py --extra-overrides "data.train_batch_size=16;trainer.total_epochs=20"
+# Shorter run (10 epochs ≈ 800 steps)
+modal run --detach modal_app/train.py --extra-overrides "trainer.total_epochs=10"
 
 # Different gage list
-modal run modal_app/train.py --train-config configs/train_config.yaml
+modal run --detach modal_app/train.py --train-config configs/train_config.yaml
 ```
 
 What happens under the hood, in order:
-1. Modal builds the training image: `verlai/verl:app-verl0.5-sglang0.4.8-mcore0.13.0-te2.2` + EF5 binary + flash-attn (built from source on first run).
-2. `scripts/build_verl_dataset.py` writes `train.parquet` / `val.parquet` to the Modal volume — each row carries the chat prompt plus `extra_info.tools_kwargs` so verl knows how to instantiate `HydroEnvironment` per rollout.
-3. `python -m verl.trainer.main_ppo` is launched with the Hydra config at `configs/verl/qwen3_4b_grpo.yaml` (which composes on top of verl's `ppo_trainer` defaults via the `defaults` block + `hydra.searchpath`).
-4. SGLang serves rollouts with K=8 generations per prompt; for each rollout it dispatches `set_parameters` → `run_simulation` → `evaluate` to the registered `BaseTool` subclasses in `src/hydrollm/verl_tools.py`. Each tool runs in-process and returns a per-turn reward (`+0.02` for valid `set_parameters`, `+0.05` for `run_simulation`, ΔNSE for `evaluate`, `−0.5` for invalid).
-5. After the trajectory completes, `verl_reward.compute_score` adds the terminal NSE bonus (best-NSE clipped + `+0.5` if NSE > target − `0.02·n_runs`).
-6. Checkpoints land in `/checkpoints/qwen3-4b-grpo` on the persistent Modal Volume; W&B logs `pg_loss`, `grad_norm`, `critic/score/mean`, and `actor/entropy` per step.
+1. Modal builds the training image: `verlai/verl:app-verl0.5-sglang0.4.8-mcore0.13.0-te2.2` + EF5 binary + flash-attn (built from source on first run, cached after).
+2. The data layer pulls a *commit-pinned* `data.tar.gz` from `chrimerss/hydro_cali_agent_example` (`pet/`, `basic_data/`, `gauge/USGS_*_1h_UTC.csv`, per-gage `data_mrms_clip/<gage_id>/`, `docs/control.txt`) and strips macOS AppleDouble metadata. Bump the SHA in `modal_app/images.py` whenever you re-upload `data.tar.gz`.
+3. `scripts/build_verl_dataset.py` writes `train.parquet` / `val.parquet` to the Modal volume — each row carries the chat prompt plus `extra_info.tools_kwargs` so verl knows how to instantiate `HydroEnvironment` per rollout.
+4. `python -m verl.trainer.main_ppo` is launched with the Hydra config at `configs/verl/qwen3_4b_grpo.yaml` (composes on top of verl's `ppo_trainer` defaults via `defaults: [ppo_trainer, _self_]` + `hydra.searchpath`).
+5. SGLang serves rollouts with K=6 generations per prompt; for each rollout it dispatches `set_parameters` → `run_simulation` → `evaluate` to the registered `BaseTool` subclasses in `src/hydrollm/verl_tools.py`. EF5 invocations are gated by a per-worker asyncio semaphore (`_EF5_CONCURRENCY=8`, × 4 workers = 32 system-wide) to avoid CPU/IO contention.
+6. Per-turn rewards: `+0.02` for valid `set_parameters`, `+0.05` for `run_simulation`, ΔNSE for `evaluate`, `−0.5` for invalid. Terminal: `verl_reward.compute_score` adds best-NSE (clipped) + `+0.5` if NSE > target − `0.02·n_runs`.
+7. Checkpoints land in `/checkpoints/qwen3-4b-grpo` on the persistent Modal Volume every 10 steps. `resume_mode: auto` recovers from the 24h Modal function-timeout cycle automatically.
 
-Monitor on [W&B](https://wandb.ai) — look for `critic/score/mean` rising above the validation step:0 baseline (~−0.6 for the raw model on gage 02338660) and `pg_loss` non-zero (zero `pg_loss` means no GRPO variance → broken setup, not just slow learning).
+Monitor on [W&B](https://wandb.ai) — look for `critic/score/mean` rising above the validation step:0 baseline (`-0.41`) and `pg_loss` non-zero (zero `pg_loss` means no GRPO variance → mode collapse, not just slow learning).
+
+#### Updating the data tarball
+
+If you change gages or time windows:
+
+```bash
+# 1. (optional) Re-run the audit to pick clean flood-event windows:
+python scripts/audit_flood_windows.py
+python scripts/apply_audit.py
+
+# 2. Edit configs/train_config.yaml gage_configs list.
+# 3. Edit scripts/build_data_tarball.py TRAIN_GAGES list.
+# 4. Rebuild + upload:
+python scripts/build_data_tarball.py
+python -c "from huggingface_hub import HfApi, login; import os; login(token=os.environ['HF_TOKEN']); HfApi().upload_file(path_or_fileobj='/tmp/hydro_data_build/data.tar.gz', path_in_repo='data.tar.gz', repo_id='chrimerss/hydro_cali_agent_example', repo_type='dataset')"
+
+# 5. Note the new commit SHA from the upload, then bump it in
+#    modal_app/images.py (search for `hf_dataset_commit=`) so Modal
+#    rebuilds only the data layer.
+```
 
 ### 5. SFT Training (legacy)
 
@@ -231,15 +256,19 @@ Hydra overlay on top of verl's `ppo_trainer` defaults. Key knobs:
 | Hydra key | Default | Description |
 |-----------|---------|-------------|
 | `algorithm.adv_estimator` | `grpo` | GRPO (group-relative advantages) |
-| `data.train_batch_size` | 8 | Prompts per step (×K=8 rollouts) |
-| `actor_rollout_ref.rollout.n` | 8 | K rollouts per prompt |
-| `actor_rollout_ref.rollout.temperature` | 1.1 | Sampling temperature (>1 for exploration) |
-| `actor_rollout_ref.rollout.multi_turn.max_assistant_turns` | 10 | Max calibration rounds per rollout |
-| `actor_rollout_ref.actor.optim.lr` | 5e-6 | Actor learning rate |
+| `data.train_batch_size` | 4 | Prompts per step (×K=8 rollouts → 32 trajectories per step) |
+| `actor_rollout_ref.rollout.n` | 6 | K rollouts per prompt (GRPO group size) |
+| `actor_rollout_ref.rollout.temperature` | 1.2 | Sampling temperature (>1 for exploration) |
+| `actor_rollout_ref.rollout.top_p` | 0.97 | Nucleus sampling top-p |
+| `actor_rollout_ref.rollout.multi_turn.max_assistant_turns` | 50 | Max calibration rounds per rollout |
+| `actor_rollout_ref.actor.optim.lr` | 1e-6 | Actor learning rate (5e-6 caused mode collapse) |
+| `actor_rollout_ref.actor.optim.lr_warmup_steps_ratio` | 0.05 | LR warmup over first 5% of steps |
+| `actor_rollout_ref.actor.entropy_coeff` | 0.05 | Entropy bonus — prevents GRPO group collapse |
 | `actor_rollout_ref.actor.kl_loss_coef` | 0.001 | KL penalty (low — leans on multi-turn variance) |
 | `data.max_response_length` | 4096 | Max tokens per assistant turn |
 | `trainer.total_epochs` | 30 | Training epochs |
-| `trainer.save_freq` | 50 | Checkpoint cadence (steps) |
+| `trainer.save_freq` | 10 | Checkpoint cadence (steps) — first save lands ~5h in |
+| `trainer.test_freq` | 25 | Validation cadence (steps) |
 | `trainer.n_gpus_per_node` | 4 | GPUs (single Modal container) |
 
 ### Adding New Gages (Phase 2)
@@ -326,7 +355,7 @@ The model has access to three tools during calibration:
 - [x] **Phase 0**: Baseline evaluation infrastructure
 - [x] **Phase 1**: SFT distillation from GPT-4o calibration trajectories (29 gages)
 - [x] **Phase 2**: GRPO RL on single gage (02338660)
-- [ ] **Phase 3**: Scale RL to 20+ CONUS gages
+- [x] **Phase 3**: Scale RL to 10 CONUS gages (current — small/medium basins on 4×H100)
 - [ ] **Phase 4**: Paper & model release on HuggingFace
 
 ## Citation

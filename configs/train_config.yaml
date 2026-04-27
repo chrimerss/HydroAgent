@@ -8,7 +8,7 @@ kl_coef: 0.05              # KL divergence penalty coefficient
 num_train_epochs: 30        # Training epochs
 
 # Multi-turn
-max_turns: 10               # Max calibration rounds per rollout
+max_turns: 50               # Max calibration rounds per rollout
 
 # Environment
 ef5_timeout: 120            # Seconds per EF5 simulation run
@@ -18,13 +18,19 @@ report_to: wandb
 logging_steps: 1
 save_steps: 50
 
-# Phase 1: single gage
+# Phase 2: 10 small/medium CONUS gages (basin <= 2401 km^2).
+# Dropped 06279500 (40792 km^2) and 07144100 (3209 km^2) — too slow,
+# caused EF5 timeouts under K=8 multi-turn rollout. Replaced with
+# 11383500 (539 km^2) and 07195430 (1489 km^2) from the audit pool.
+# 02338660 is held out for testing.
 gage_configs:
-  - configs/gages/02338660.yaml
-
-# Phase 2: uncomment to scale to 20 CONUS gages
-# gage_configs:
-#   - configs/gages/02338660.yaml
-#   - configs/gages/01632000.yaml
-#   - configs/gages/03364000.yaml
-#   ... (add more)
+  - configs/gages/02294781.yaml
+  - configs/gages/02312000.yaml
+  - configs/gages/07195430.yaml
+  - configs/gages/11043000.yaml
+  - configs/gages/11152000.yaml
+  - configs/gages/11179000.yaml
+  - configs/gages/11376000.yaml
+  - configs/gages/11383500.yaml
+  - configs/gages/14207500.yaml
+  - configs/gages/14301000.yaml

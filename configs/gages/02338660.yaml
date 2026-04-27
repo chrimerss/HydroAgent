@@ -2,12 +2,12 @@ gage_id: "02338660"
 lon: -84.9876
 lat: 33.2357
 basin_area: 328.93
-obs_dir: /app/data/gauge_18_19
+obs_dir: /app/data/gauge
 control_template: /app/data/docs/control.txt
 time_begin: "201807010000"
 time_end: "201808312300"
 target_nse: 0.8075
-ef5_timeout: 120
+ef5_timeout: 300
 parameter_ranges:
   wm: [0.1, 10.0]
   b: [0.000001, 3.0]
