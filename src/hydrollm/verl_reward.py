@@ -18,7 +18,14 @@ from typing import Any
 
 _TARGET_BONUS = 0.5
 _BEST_NSE_WEIGHT = 1.0
-_NUM_RUNS_PENALTY = 0.02
+# Per-evaluate INCENTIVE (not penalty) to encourage long-horizon iteration.
+# Earlier we used a -0.02 penalty per evaluate call; that taught the model
+# to exit after 1 round. The user wants long-horizon calibration, so we
+# pay a small bonus for each completed iteration. Capped via max_assistant_turns.
+_PER_EVALUATE_BONUS = 0.02
+# Reward strict monotonic improvement: each evaluate that beats the prior
+# best earns this. This explicitly trains "iterate until you can't improve".
+_IMPROVEMENT_BONUS = 0.1
 
 
 def _extract_nse_history(text: str) -> list[float]:
@@ -82,5 +89,18 @@ def compute_score(
     score = _BEST_NSE_WEIGHT * max(min(best, 1.0), -1.0)
     if best > target_nse:
         score += _TARGET_BONUS
-    score -= _NUM_RUNS_PENALTY * len(history)
+
+    # Reward iteration. Per-evaluate bonus for sustained engagement.
+    score += _PER_EVALUATE_BONUS * len(history)
+    # Plus an extra bonus for each evaluate that improved on the running best.
+    running_best = float("-inf")
+    n_improvements = 0
+    for nse in history:
+        if nse > running_best:
+            n_improvements += 1
+            running_best = nse
+    # The very first evaluate is "improvement vs -inf" — don't double-count
+    # by subtracting one (or treat the trajectory must have at least one).
+    score += _IMPROVEMENT_BONUS * max(0, n_improvements - 1)
+
     return float(score)

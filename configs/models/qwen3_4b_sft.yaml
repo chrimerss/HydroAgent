@@ -1,12 +1,15 @@
-# Qwen3-8B SFT configuration — distillation from GPT-4o
-# Output model: chrimerss/Qwen-3-8B-hydro-distill
+# Qwen3-4B-Instruct-2507 SFT — long-horizon distillation from GPT-5 trajectories.
+# Output model (full-weight, LoRA-merged): chrimerss/Qwen3-4B-hydro-sft
+# GRPO (configs/verl/qwen3_4b_grpo.yaml) starts from this so RL begins from
+# a model that already understands sequential calibration and tool format.
 name: "qwen3-4b-sft"
 model_id: "Qwen/Qwen3-4B-Instruct-2507"
-hf_repo_id: "chrimerss/Qwen-3-4B-hydro-distill"
+hf_repo_id: "chrimerss/Qwen3-4B-hydro-sft"
 
-# LoRA configuration (same architecture as RL for compatibility)
-lora_r: 8
-lora_alpha: 16
+# LoRA — merged before push, so the verl/SGLang weight loader sees a
+# clean HF-format model (no PEFT prefixes).
+lora_r: 16
+lora_alpha: 32
 lora_target_modules:
   - "q_proj"
   - "k_proj"
@@ -16,13 +19,15 @@ lora_target_modules:
   - "up_proj"
   - "down_proj"
 
-# Training
-grad_accum_steps: 8
-num_train_epochs: 1
-per_device_train_batch_size: 2
+# 71 trajectories × 3 epochs = ~210 update steps with grad_accum=8 — small
+# enough to avoid overfitting, big enough to teach long-horizon format.
+num_train_epochs: 3
+per_device_train_batch_size: 1
 gradient_accumulation_steps: 8
-learning_rate: 2.0e-6
+learning_rate: 1.0e-5
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
-max_seq_length: 4096
+# Long-horizon trajectories run up to ~20 rounds × ~2k tokens each → keep
+# room for the longest sample.
+max_seq_length: 16384
 bf16: true

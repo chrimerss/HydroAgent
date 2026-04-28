@@ -1,616 +1,385 @@
 #!/usr/bin/env python3
-"""Convert GPT-4o calibration histories to multi-turn chat JSONL for SFT.
+"""Convert GPT-5 calibration histories to long-horizon multi-turn SFT JSONL.
 
-Scans all calibration_history.json files in sets_for_SFT_RL/, converts each
-round+candidate into a multi-turn tool-calling conversation that matches the
-HydroLLM tool schema (set_parameters → run_simulation → evaluate).
+Each `calibration_history.json` becomes ONE long sequential conversation:
 
-Includes ALL rounds and candidates (including unsuccessful ones) to give the
-model a rich corpus that covers both good and bad parameter choices.
+    system  → user  →
+        round_1: assistant_set → tool_set → assistant_run → tool_run →
+                 assistant_eval → tool_eval (NSE feedback) →
+        round_2: assistant_set → tool_set → assistant_run → tool_run →
+                 assistant_eval → tool_eval (NSE feedback) →
+        ...
+        round_N: same →
+        final assistant summary.
 
-Quality weighting: each example gets a `weight` field based on the best NSE
-achieved in that trajectory, so the training can up-weight successful episodes.
+Per round we use the BEST candidate (by `best_candidate_index`) so the
+trajectory shows monotonic-ish improvement. The goal of this format is to
+teach the model long-horizon iterative calibration — not isolated single
+runs.
+
+The user prompt mirrors `src/hydrollm/prompts.py:build_user_prompt` and
+deliberately does NOT include a `target_nse`; the objective is to
+"maximize NSE as much as possible".
 
 Usage:
     python scripts/prepare_sft_data.py
     python scripts/prepare_sft_data.py --output data/sft_train.jsonl
-    python scripts/prepare_sft_data.py --upload  # Upload to HuggingFace
+    python scripts/prepare_sft_data.py --upload  # upload to HF dataset
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# Allow running from repo root without install.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-SYSTEM_PROMPT = """\
-You are an expert hydrologic model calibration scientist. Your task is to \
-calibrate the EF5/CREST (Coupled Routing and Excess STorage) distributed \
-hydrologic model by iteratively tuning physical parameter multipliers.
+from hydrollm.config import (  # noqa: E402
+    PARAMETER_RANGES,
+    TUNABLE_PARAMETERS,
+    DEFAULT_PARAMETERS,
+)
+from hydrollm.prompts import SYSTEM_PROMPT  # noqa: E402
 
-You have deep understanding of:
-- Rainfall-runoff processes and how they are parameterized in CREST
-- Soil moisture dynamics, infiltration, and surface/subsurface partitioning
-- Kinematic wave routing in channels and overland flow
-- How parameter interactions affect hydrograph shape, peak, volume, and timing
 
-Strategy:
-1. Start with reasonable initial parameters based on watershed characteristics
-2. Run a simulation to establish a baseline
-3. Diagnose errors by analyzing peak flows, volume, and timing
-4. Adjust parameters systematically — change one process at a time
-5. Iterate until the NSE target is met or no further improvement is possible
-
-You have access to three tools:
-- set_parameters: Set the 11 tunable CREST model parameters
-- run_simulation: Execute EF5 and get hydrograph diagnostics + NSE
-- evaluate: Review your calibration progress across all runs
-
-Always reason about the physical meaning of your parameter choices before \
-making changes. Explain your diagnostic reasoning after each simulation run.\
-"""
-
-PARAMETER_RANGES = {
-    "wm": (0.1, 10.0),
-    "b": (0.000001, 3.0),
-    "im": (0.0, 1.0),
-    "ke": (0.8, 1.2),
-    "fc": (0.1, 2.0),
-    "under": (0.1, 10.0),
-    "leaki": (0.1, 10.0),
-    "alpha": (0.1, 3.0),
-    "beta": (0.1, 3.0),
-    "alpha0": (0.0, 3.0),
-    "iwu": (0.1, 100.0),
-    "th": (10.0, 10.0),
-    "isu": (0.0, 0.0),
-}
-
-TUNABLE_PARAMETERS = [k for k, (lo, hi) in PARAMETER_RANGES.items() if lo != hi]
-
-# Core 11 parameters the tool expects (exclude th, isu which are fixed)
+# Core 11 parameters the tool expects (exclude th/isu which are fixed).
 TOOL_PARAMS = ["wm", "b", "im", "ke", "fc", "under", "leaki",
                "alpha", "beta", "alpha0", "iwu"]
 
+GAGE_RE = re.compile(r"_(\d{8})_")
+
 
 def extract_gage_id(dirname: str) -> str:
-    """Extract gage ID from experiment directory name.
-
-    Examples:
-        conus_batch_test_exp_001_01400500_2018_... → 01400500
-        exp_001_02338660_2018_... → 02338660
-        debug_03076500_2018_... → 03076500
-    """
-    # Pattern: look for 8-digit USGS gage ID
-    match = re.search(r'_(\d{8})_', dirname)
-    if match:
-        return match.group(1)
-    # Fallback: look for any 7-8 digit sequence
-    match = re.search(r'(\d{7,8})', dirname)
-    if match:
-        return match.group(1)
-    return "unknown"
+    m = GAGE_RE.search(dirname)
+    return m.group(1) if m else "unknown"
 
 
 def build_user_prompt(gage_id: str) -> str:
-    """Build the user prompt for a specific gage (simplified from prompts.py)."""
-    param_lines = []
-    for param in TUNABLE_PARAMETERS:
-        lo, hi = PARAMETER_RANGES[param]
-        param_lines.append(f"  - {param}: [{lo}, {hi}]")
-    param_table = "\n".join(param_lines)
-
-    return f"""\
-Calibrate the CREST hydrologic model for USGS gage {gage_id}.
-
-Objective: Achieve NSE > 0.8075
-
-Tunable Parameters (name: [min, max]):
-{param_table}
-
-Fixed Parameters (do not change):
-  - th: 10.0 (channel initiation threshold)
-  - isu: 0.0 (initial interflow storage)
-
-Instructions:
-1. First, propose an initial set of parameter values and run a simulation
-2. Analyze the results and identify the main sources of error
-3. Adjust parameters based on your hydrologic understanding
-4. Repeat until NSE > 0.8075 or you cannot improve further
-
-Begin calibration.\
-"""
+    """User prompt without `target_nse` — open-ended NSE maximization."""
+    param_lines = "\n".join(
+        f"  - {p}: [{PARAMETER_RANGES[p][0]}, {PARAMETER_RANGES[p][1]}]"
+        for p in TUNABLE_PARAMETERS
+    )
+    return (
+        f"Calibrate the CREST hydrologic model for USGS gage {gage_id}.\n\n"
+        f"Objective: Maximize NSE as much as possible. Iterate as many "
+        f"calibration rounds as needed — keep adjusting parameters as long "
+        f"as you can find further improvements.\n\n"
+        f"Tunable Parameters (name: [min, max]):\n{param_lines}\n\n"
+        f"Fixed Parameters (do not change):\n"
+        f"  - th: 10.0 (channel initiation threshold)\n"
+        f"  - isu: 0.0 (initial interflow storage)\n\n"
+        f"Begin by calling set_parameters."
+    )
 
 
-def build_tool_call(name: str, arguments: dict) -> str:
-    """Format a tool call in Hermes/Qwen style."""
-    call_data = {"name": name, "arguments": arguments}
-    return f"<tool_call>\n{json.dumps(call_data)}\n</tool_call>"
+def _hermes(name: str, arguments: dict) -> str:
+    return f'<tool_call>\n{json.dumps({"name": name, "arguments": arguments})}\n</tool_call>'
 
 
-def build_set_parameters_args(params: dict) -> dict:
-    """Extract the 11 tunable parameters for set_parameters tool call."""
-    return {k: params[k] for k in TOOL_PARAMS if k in params}
+def _params_for_tool(params: dict) -> dict:
+    return {k: round(float(params[k]), 6) for k in TOOL_PARAMS if k in params}
 
 
-def build_sim_result(candidate: dict) -> dict:
-    """Build a simulated run_simulation result from candidate metrics."""
-    metrics = candidate.get("metrics", {})
-    full_metrics = candidate.get("full_metrics", {})
+def _validated_params(params: dict) -> dict:
+    """Clamp + format params for the tool reply (matches HydroEnvironment)."""
+    out = dict(DEFAULT_PARAMETERS)
+    for k, v in params.items():
+        if k in PARAMETER_RANGES:
+            lo, hi = PARAMETER_RANGES[k]
+            out[k] = max(lo, min(hi, float(v)))
+    return {k: round(float(v), 6) for k, v in out.items()}
 
-    # Use full_metrics NSE if available, otherwise aggregate
-    nse = full_metrics.get("NSE", metrics.get("NSE", -1.0))
 
-    return {
+def _evaluate_payload(candidate: dict, nse_running: list[float]) -> dict:
+    """Build a JSON evaluate-tool result mirroring HydroEnvironment.evaluate."""
+    full = candidate.get("full_metrics", {}) or {}
+    nse = full.get("NSE", candidate.get("metrics", {}).get("NSE"))
+    if not isinstance(nse, (int, float)):
+        nse = -999.0
+    payload = {
         "status": "ok",
-        "nse": round(nse, 4),
-        "peak_sim_m3s": round(full_metrics.get("sim_peak", 0), 2),
-        "peak_obs_m3s": round(full_metrics.get("obs_peak", 0), 2),
-        "volume_ratio": round(
-            full_metrics.get("peak_ratio", metrics.get("peak_ratio", 0)), 3
+        "message": "Metrics calculated.",
+        "NSE": round(float(nse), 4),
+        "CC": round(float(full.get("CC", -999)), 4),
+        "KGE": round(float(full.get("KGE", -999)), 4),
+        "sim_peak": round(float(full.get("sim_peak", 0)), 4),
+        "obs_peak": round(float(full.get("obs_peak", 0)), 4),
+        "peak_ratio": round(float(full.get("peak_ratio", 0)), 4),
+        "lag_hours_sim_minus_obs": round(
+            float(full.get("lag_hours_sim_minus_obs", 0)), 4
         ),
-        "timing_error_hours": abs(int(
-            full_metrics.get("lag_hours_sim_minus_obs",
-                             metrics.get("lag_hours", 0))
-        )),
     }
+    return payload
 
 
-def build_eval_result(nse_history: list[float], current_params: dict,
-                       target_nse: float = 0.8075) -> dict:
-    """Build an evaluate tool result."""
-    best_nse = max(nse_history) if nse_history else None
-    return {
-        "current_nse": round(nse_history[-1], 4) if nse_history else None,
-        "best_nse": round(best_nse, 4) if best_nse is not None else None,
-        "nse_history": [round(n, 4) for n in nse_history],
-        "num_runs": len(nse_history),
-        "target_nse": target_nse,
-        "target_met": best_nse is not None and best_nse > target_nse,
-        "current_params": {k: round(v, 6) for k, v in current_params.items()},
-    }
+def _round_reasoning(round_data: dict, cand: dict, prev_nse: float | None) -> str:
+    """Synthesize an assistant reasoning paragraph for this round."""
+    cand_idx = cand.get("candidate_index", 0)
+    refined = (round_data.get("refined_candidates") or [])
+    proposals = (round_data.get("proposals") or [])
+    rationale = ""
+    if cand_idx < len(refined) and refined[cand_idx].get("rationale"):
+        rationale = refined[cand_idx]["rationale"]
+    elif cand_idx < len(proposals) and proposals[cand_idx].get("goal"):
+        rationale = proposals[cand_idx]["goal"]
+    elif round_data.get("rationale"):
+        rationale = round_data["rationale"]
 
-
-def synthesize_reasoning(
-    candidate: dict,
-    round_data: dict,
-    round_idx: int,
-    cand_idx: int,
-    nse_history: list[float],
-    is_first: bool,
-) -> str:
-    """Synthesize assistant reasoning text from calibration data.
-
-    Combines proposal goals, rationale, and diagnostic analysis.
-    """
     parts = []
-
-    # Try to find the matching proposal/refined candidate
-    proposals = round_data.get("proposals", [])
-    refined = round_data.get("refined_candidates", [])
-
-    # Match refined candidate to this index if possible
-    if cand_idx < len(refined):
-        r = refined[cand_idx]
-        if r.get("rationale"):
-            parts.append(f"**Rationale**: {r['rationale']}")
-    elif cand_idx < len(proposals):
-        p = proposals[cand_idx]
-        if p.get("goal"):
-            parts.append(f"**Strategy**: {p['goal']}")
-
-    # Add context based on position
-    if is_first:
-        parts.insert(0, f"I'll begin calibrating by proposing an initial parameter set for round {round_idx}.")
-    else:
-        # Refer to previous results
-        if nse_history:
-            prev_nse = nse_history[-1]
-            parts.insert(0,
-                f"The previous simulation achieved NSE = {prev_nse:.4f}. "
-                f"Let me adjust parameters based on the hydrograph diagnostics."
-            )
-
-    if not parts:
+    if prev_nse is None:
         parts.append(
-            f"Proposing parameter set {cand_idx} for round {round_idx} "
-            f"based on watershed analysis."
+            "Starting calibration. I'll propose an initial set of parameters "
+            "based on watershed characteristics and standard CREST defaults."
         )
-
+    else:
+        parts.append(
+            f"Previous best NSE = {prev_nse:.4f}. Adjusting parameters to "
+            f"target the dominant residual error."
+        )
+    if rationale:
+        parts.append(f"Rationale: {rationale.strip()}")
     return "\n\n".join(parts)
 
 
-def synthesize_analysis(candidate: dict, nse_history: list[float]) -> str:
-    """Synthesize assistant analysis after seeing simulation results."""
-    metrics = candidate.get("metrics", {})
-    full_metrics = candidate.get("full_metrics", {})
-
-    nse = full_metrics.get("NSE", metrics.get("NSE", -1.0))
-    peak_ratio = full_metrics.get("peak_ratio", metrics.get("peak_ratio", 0))
-    lag = full_metrics.get("lag_hours_sim_minus_obs", metrics.get("lag_hours", 0))
-
-    parts = [f"NSE = {nse:.4f}."]
-
-    # Peak analysis
-    if peak_ratio < 0.7:
-        parts.append(f"Peak ratio is {peak_ratio:.2f} — simulated peaks are too low. "
-                     "Need to increase runoff generation (lower wm, higher b or im) "
-                     "or reduce routing attenuation.")
-    elif peak_ratio > 1.3:
-        parts.append(f"Peak ratio is {peak_ratio:.2f} — simulated peaks are too high. "
-                     "Need to increase infiltration/storage (higher wm, lower im) "
-                     "or increase routing attenuation.")
+def _round_diagnosis(payload: dict, prev_nse: float | None) -> str:
+    """Synthesize a short post-evaluate diagnosis."""
+    nse = payload["NSE"]
+    pr = payload["peak_ratio"]
+    lag = payload["lag_hours_sim_minus_obs"]
+    bits = [f"NSE = {nse:.4f}."]
+    if pr < 0.7:
+        bits.append(
+            f"Peaks underestimated (peak_ratio={pr:.2f}); increase runoff "
+            "generation (raise im or lower wm) or relax routing attenuation."
+        )
+    elif pr > 1.3:
+        bits.append(
+            f"Peaks overestimated (peak_ratio={pr:.2f}); raise storage (wm) "
+            "or strengthen routing attenuation."
+        )
     else:
-        parts.append(f"Peak ratio is {peak_ratio:.2f} — within reasonable range.")
+        bits.append(f"Peak magnitude reasonable (peak_ratio={pr:.2f}).")
+    if abs(lag) > 6:
+        when = "late" if lag > 0 else "early"
+        bits.append(
+            f"Timing offset {abs(lag):.0f}h {when}; tune routing (alpha, beta, alpha0)."
+        )
+    if prev_nse is not None:
+        delta = nse - prev_nse
+        if delta > 0:
+            bits.append(f"Improved by {delta:.4f}; keep this direction.")
+        elif delta < -0.05:
+            bits.append(
+                f"Regressed by {abs(delta):.4f}; revert and try a different lever."
+            )
+    return " ".join(bits)
 
-    # Timing analysis
-    if abs(lag) > 10:
-        direction = "late" if lag > 0 else "early"
-        parts.append(f"Timing error: {abs(lag):.0f} hours {direction}. "
-                     "Need to adjust routing parameters (alpha, beta, alpha0).")
-    elif abs(lag) > 3:
-        direction = "late" if lag > 0 else "early"
-        parts.append(f"Minor timing offset: {abs(lag):.0f} hours {direction}.")
+
+def _final_summary(best_nse: float, best_params: dict) -> str:
+    if best_nse > 0.7:
+        verdict = "Strong calibration."
+    elif best_nse > 0.4:
+        verdict = "Moderate calibration."
+    elif best_nse > 0:
+        verdict = "Weak calibration — further refinement recommended."
     else:
-        parts.append("Timing is well-aligned.")
-
-    # Progress
-    if len(nse_history) > 1:
-        improvement = nse_history[-1] - nse_history[-2]
-        if improvement > 0:
-            parts.append(f"NSE improved by {improvement:.4f} from previous run.")
-        elif improvement < -0.1:
-            parts.append(f"NSE decreased by {abs(improvement):.4f}. "
-                         "The parameter change was too aggressive.")
-
-    # Target check
-    if nse > 0.8075:
-        parts.append("✅ Target NSE > 0.8075 achieved!")
-    elif nse > 0.6:
-        parts.append("Getting close to the target. Fine-tuning needed.")
-    elif nse > 0.3:
-        parts.append("Moderate performance. Significant adjustments still needed.")
-    elif nse > 0:
-        parts.append("Below target. Need substantial parameter changes.")
-    else:
-        parts.append("Negative NSE — model is performing worse than the mean. "
-                     "Fundamental parameter rethinking needed.")
-
-    return " ".join(parts)
+        verdict = "Calibration unsuccessful — strategy needs to be revisited."
+    pretty = ", ".join(f"{k}={v:.4f}" for k, v in sorted(best_params.items()))
+    return (
+        f"Best NSE achieved: {best_nse:.4f}. {verdict} "
+        f"Final parameter set: {pretty}."
+    )
 
 
-def convert_calibration_to_conversations(
-    cal_history: dict,
-    gage_id: str,
-    exp_dir: str,
-) -> list[dict]:
-    """Convert a single calibration history to list of conversation dicts.
+def trajectory_to_messages(cal_history: dict, gage_id: str) -> list[dict] | None:
+    """Convert one calibration_history.json into a single multi-turn SFT example.
 
-    Creates multi-turn sequential data using a sliding window approach.
-    For each candidate at round N, the context includes the best candidates
-    from rounds 0 to N-1, and then the current candidate as the N-th turn.
-
-    Returns a list of conversation dicts, each with:
-        - messages: list of {role, content} dicts
-        - metadata: {gage_id, exp_dir, best_nse, weight}
+    Returns:
+        list of message dicts in OpenAI/Hermes format, or None if the
+        trajectory has no usable rounds.
     """
-    rounds = cal_history.get("rounds", [])
-    best_info = cal_history.get("best") or {}
-    best_metrics = best_info.get("metrics") or {}
-    best_overall_nse = best_metrics.get("NSE", -1.0)
+    rounds = cal_history.get("rounds") or []
+    if not rounds:
+        return None
 
-    conversations = []
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_user_prompt(gage_id)},
+    ]
 
-    # History of messages from the best candidate of each previous round
-    history_messages = []
-    # History of NSEs from the best candidate of each previous round
-    nse_history_global = []
+    nse_running: list[float] = []
+    best_nse = float("-inf")
+    best_params: dict = {}
+    n_rounds_used = 0
 
     for round_data in rounds:
-        round_idx = round_data.get("round_index", 0)
-        candidates = round_data.get("candidates", [])
-
+        candidates = round_data.get("candidates") or []
         if not candidates:
             continue
-
-        round_turns = []
-
-        for cand in candidates:
-            cand_idx = cand.get("candidate_index", 0)
-            params = cand.get("params", {})
-            if not params:
-                continue
-
-            # Build the current candidate's turn
-            turn_messages = []
-
-            # If we have no prior rounds' best result, this is the first turn
-            is_first = (len(nse_history_global) == 0)
-
-            # Assistant reasoning + tool call
-            reasoning = synthesize_reasoning(
-                cand, round_data, round_idx, cand_idx,
-                nse_history_global, is_first
-            )
-
-            tool_args = build_set_parameters_args(params)
-            tool_call_text = build_tool_call("set_parameters", tool_args)
-
-            turn_messages.append({
-                "role": "assistant",
-                "content": f"{reasoning}\n\n{tool_call_text}",
-            })
-
-            # Tool result: set_parameters response
-            validated_params = {k: round(v, 6) for k, v in params.items()
-                               if k in PARAMETER_RANGES}
-            turn_messages.append({
-                "role": "tool",
-                "name": "set_parameters",
-                "content": json.dumps({
-                    "status": "ok",
-                    "validated_params": validated_params,
-                }),
-            })
-
-            # Assistant calls run_simulation
-            turn_messages.append({
-                "role": "assistant",
-                "content": f"Parameters set. Running EF5/CREST simulation...\n\n"
-                           f"{build_tool_call('run_simulation', {})}",
-            })
-
-            # Tool result: simulation results
-            sim_result = build_sim_result(cand)
-            turn_messages.append({
-                "role": "tool",
-                "name": "run_simulation",
-                "content": json.dumps(sim_result),
-            })
-
-            # Track NSE
-            cand_nse = sim_result["nse"]
-            local_nse_history = list(nse_history_global) + [cand_nse]
-
-            # Assistant analysis
-            analysis = synthesize_analysis(cand, local_nse_history)
-            turn_messages.append({
-                "role": "assistant",
-                "content": analysis,
-            })
-
-            # Optionally call evaluate at end
-            eval_result = build_eval_result(
-                local_nse_history, params
-            )
-            turn_messages.append({
-                "role": "assistant",
-                "content": f"Let me check the overall calibration progress.\n\n"
-                           f"{build_tool_call('evaluate', {})}",
-            })
-            turn_messages.append({
-                "role": "tool",
-                "name": "evaluate",
-                "content": json.dumps(eval_result),
-            })
-
-            # Save the raw turn (without final summary) for potential history continuation
-            round_turns.append((turn_messages, cand_nse))
-
-            # Final assistant summary only at the very end of this sliding window
-            final_turn_messages = list(turn_messages)
-            if cand_nse > 0.8075:
-                final_msg = (
-                    f"Calibration target achieved! Best NSE = {cand_nse:.4f} "
-                    f"exceeds the target of 0.8075. The optimized parameters are: "
-                    + ", ".join(f"{k}={v:.4f}" for k, v in sorted(tool_args.items()))
-                )
-            elif cand_nse > 0.5:
-                final_msg = (
-                    f"Good progress with NSE = {cand_nse:.4f}. "
-                    f"Further refinement of parameters is recommended, "
-                    f"focusing on peak timing and volume balance."
-                )
-            else:
-                final_msg = (
-                    f"Current NSE = {cand_nse:.4f} is below target. "
-                    f"Need to revisit the parameter strategy — "
-                    f"consider adjusting the process that dominates the error."
-                )
-            final_turn_messages.append({"role": "assistant", "content": final_msg})
-
-            # Now build the full conversation:
-            # System prompt -> User prompt -> history_messages -> final_turn_messages
-            messages = []
-            messages.append({"role": "system", "content": SYSTEM_PROMPT})
-            messages.append({"role": "user", "content": build_user_prompt(gage_id)})
-            messages.extend(history_messages)
-            messages.extend(final_turn_messages)
-
-            # Compute quality weight
-            # Scale: NSE in [-1, 1] → weight in [0.1, 1.0]
-            weight = max(0.1, min(1.0, (cand_nse + 1.0) / 2.0))
-
-            conversations.append({
-                "messages": messages,
-                "metadata": {
-                    "gage_id": gage_id,
-                    "exp_dir": exp_dir,
-                    "round_index": round_idx,
-                    "candidate_index": cand_idx,
-                    "nse": cand_nse,
-                    "best_nse": best_overall_nse,
-                    "weight": round(weight, 4),
-                },
-            })
-
-        # Update history with the best candidate's turn from this round
-        if round_turns:
-            best_idx = round_data.get("best_candidate_index", 0)
-            if best_idx < len(round_turns):
-                best_turn_messages, best_cand_nse = round_turns[best_idx]
-            else:
-                best_turn_messages, best_cand_nse = round_turns[-1]
-            
-            history_messages.extend(best_turn_messages)
-            nse_history_global.append(best_cand_nse)
-
-    return conversations
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Convert calibration histories to SFT training data"
-    )
-    parser.add_argument(
-        "--input-dir", type=str,
-        default="sets_for_SFT_RL",
-        help="Directory containing experiment subdirectories",
-    )
-    parser.add_argument(
-        "--output", type=str,
-        default="data/sft_train.jsonl",
-        help="Output JSONL file path",
-    )
-    parser.add_argument(
-        "--upload", action="store_true",
-        help="Upload dataset to HuggingFace after preparation",
-    )
-    parser.add_argument(
-        "--hf-repo", type=str,
-        default="chrimerss/hydro_cali_agent_example",
-        help="HuggingFace dataset repo ID for upload",
-    )
-    args = parser.parse_args()
-
-    # Resolve paths relative to project root
-    script_dir = Path(__file__).resolve().parent
-    project_root = script_dir.parent
-    input_dir = project_root / args.input_dir
-    output_path = project_root / args.output
-
-    if not input_dir.exists():
-        print(f"ERROR: Input directory not found: {input_dir}")
-        sys.exit(1)
-
-    # Find all calibration_history.json files
-    cal_files = sorted(input_dir.rglob("calibration_history.json"))
-    print(f"Found {len(cal_files)} calibration history files")
-
-    # Process all files
-    all_conversations = []
-    stats = {
-        "total_files": len(cal_files),
-        "total_examples": 0,
-        "gage_ids": set(),
-        "nse_values": [],
-        "weights": [],
-        "skipped": 0,
-        "errors": 0,
-    }
-
-    for cal_file in cal_files:
-        exp_dir = cal_file.parent.parent.name
-        gage_id = extract_gage_id(exp_dir)
-        stats["gage_ids"].add(gage_id)
-
-        try:
-            with open(cal_file) as f:
-                cal_history = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"  ERROR reading {cal_file}: {e}")
-            stats["errors"] += 1
+        best_idx = round_data.get("best_candidate_index", 0)
+        if not (0 <= best_idx < len(candidates)):
+            best_idx = 0
+        cand = candidates[best_idx]
+        params = cand.get("params") or {}
+        if not params:
             continue
 
-        conversations = convert_calibration_to_conversations(
-            cal_history, gage_id, exp_dir
+        # 1) reasoning + set_parameters
+        prev_nse = nse_running[-1] if nse_running else None
+        reasoning = _round_reasoning(round_data, cand, prev_nse)
+        tool_args = _params_for_tool(params)
+        messages.append({
+            "role": "assistant",
+            "content": f"{reasoning}\n\n{_hermes('set_parameters', tool_args)}",
+        })
+        messages.append({
+            "role": "tool",
+            "name": "set_parameters",
+            "content": json.dumps({
+                "status": "ok",
+                "validated_params": _validated_params(params),
+            }),
+        })
+
+        # 2) run_simulation
+        messages.append({
+            "role": "assistant",
+            "content": f"Running EF5 simulation.\n\n{_hermes('run_simulation', {})}",
+        })
+        messages.append({
+            "role": "tool",
+            "name": "run_simulation",
+            "content": json.dumps({
+                "status": "ok",
+                "message": "Simulation completed successfully.",
+            }),
+        })
+
+        # 3) evaluate
+        eval_payload = _evaluate_payload(cand, nse_running)
+        messages.append({
+            "role": "assistant",
+            "content": f"Computing metrics.\n\n{_hermes('evaluate', {})}",
+        })
+        messages.append({
+            "role": "tool",
+            "name": "evaluate",
+            "content": json.dumps(eval_payload),
+        })
+
+        # 4) diagnosis (assistant reflects on the result)
+        messages.append({
+            "role": "assistant",
+            "content": _round_diagnosis(eval_payload, prev_nse),
+        })
+
+        nse_running.append(eval_payload["NSE"])
+        if eval_payload["NSE"] > best_nse:
+            best_nse = eval_payload["NSE"]
+            best_params = dict(tool_args)
+        n_rounds_used += 1
+
+    if n_rounds_used == 0:
+        return None
+
+    # Final summary turn so the model learns to recognize when it's done.
+    messages.append({"role": "assistant", "content": _final_summary(best_nse, best_params)})
+
+    return messages
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--input-dir", default="data/sets_for_SFT_RL",
+                   help="Directory containing per-trajectory experiment dirs.")
+    p.add_argument("--output", default="data/sft_train.jsonl")
+    p.add_argument("--upload", action="store_true",
+                   help="Upload to chrimerss/hydro_cali_agent_example after writing.")
+    p.add_argument("--hf-repo", default="chrimerss/hydro_cali_agent_example")
+    args = p.parse_args()
+
+    repo = Path(__file__).resolve().parents[1]
+    in_dir = repo / args.input_dir
+    out_path = repo / args.output
+
+    files = sorted(in_dir.rglob("calibration_history.json"))
+    print(f"Found {len(files)} calibration histories in {in_dir}")
+
+    examples: list[dict] = []
+    skipped = 0
+    for f in files:
+        gid = extract_gage_id(f.parent.parent.name)
+        try:
+            cal = json.loads(f.read_text())
+        except Exception as e:
+            print(f"  [skip] {f}: {e}")
+            skipped += 1
+            continue
+        msgs = trajectory_to_messages(cal, gid)
+        if msgs is None:
+            skipped += 1
+            continue
+        # Capture best NSE across the trajectory for quality weighting.
+        # Walk the messages and pull the NSE values out of evaluate tool replies.
+        nse_seq: list[float] = []
+        for m in msgs:
+            if m["role"] == "tool" and m.get("name") == "evaluate":
+                try:
+                    payload = json.loads(m["content"])
+                    if isinstance(payload.get("NSE"), (int, float)):
+                        nse_seq.append(float(payload["NSE"]))
+                except Exception:
+                    pass
+        best_nse = max(nse_seq) if nse_seq else -1.0
+        # weight in [0.1, 1.0]
+        weight = max(0.1, min(1.0, (best_nse + 1.0) / 2.0))
+        examples.append({
+            "messages": msgs,
+            "metadata": {
+                "gage_id": gid,
+                "exp_dir": f.parent.parent.name,
+                "n_rounds": len(nse_seq),
+                "best_nse": round(best_nse, 4),
+                "weight": round(weight, 4),
+            },
+        })
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w") as fp:
+        for ex in examples:
+            fp.write(json.dumps(ex) + "\n")
+
+    nse_vals = [e["metadata"]["best_nse"] for e in examples]
+    n_rounds = [e["metadata"]["n_rounds"] for e in examples]
+    print("=" * 60)
+    print(f"Wrote {len(examples)} trajectories to {out_path}")
+    print(f"Skipped: {skipped}")
+    if nse_vals:
+        print(
+            f"best_nse: min={min(nse_vals):.3f}  median={sorted(nse_vals)[len(nse_vals)//2]:.3f}  max={max(nse_vals):.3f}"
+        )
+    if n_rounds:
+        print(
+            f"rounds:   min={min(n_rounds)}  median={sorted(n_rounds)[len(n_rounds)//2]}  max={max(n_rounds)}"
         )
 
-        if not conversations:
-            stats["skipped"] += 1
-            continue
-
-        all_conversations.extend(conversations)
-        for conv in conversations:
-            meta = conv["metadata"]
-            stats["nse_values"].append(meta["nse"])
-            stats["weights"].append(meta["weight"])
-
-    stats["total_examples"] = len(all_conversations)
-
-    # Write output
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w") as f:
-        for conv in all_conversations:
-            f.write(json.dumps(conv) + "\n")
-
-    # Print statistics
-    print(f"\n{'='*60}")
-    print(f"SFT Data Preparation Complete")
-    print(f"{'='*60}")
-    print(f"Input files:       {stats['total_files']}")
-    print(f"Unique gages:      {len(stats['gage_ids'])}")
-    print(f"Total examples:    {stats['total_examples']}")
-    print(f"Skipped (empty):   {stats['skipped']}")
-    print(f"Errors:            {stats['errors']}")
-
-    if stats["nse_values"]:
-        import numpy as np
-        nse_arr = np.array(stats["nse_values"])
-        print(f"\nNSE Distribution:")
-        print(f"  Min:    {nse_arr.min():.4f}")
-        print(f"  25th:   {np.percentile(nse_arr, 25):.4f}")
-        print(f"  Median: {np.median(nse_arr):.4f}")
-        print(f"  75th:   {np.percentile(nse_arr, 75):.4f}")
-        print(f"  Max:    {nse_arr.max():.4f}")
-        print(f"  NSE > 0:    {np.sum(nse_arr > 0)}/{len(nse_arr)}")
-        print(f"  NSE > 0.5:  {np.sum(nse_arr > 0.5)}/{len(nse_arr)}")
-        print(f"  NSE > 0.8:  {np.sum(nse_arr > 0.8)}/{len(nse_arr)}")
-
-        weight_arr = np.array(stats["weights"])
-        print(f"\nWeight Distribution:")
-        print(f"  Min:    {weight_arr.min():.4f}")
-        print(f"  Median: {np.median(weight_arr):.4f}")
-        print(f"  Max:    {weight_arr.max():.4f}")
-
-    # Count tokens (rough estimate)
-    total_chars = sum(
-        sum(len(m.get("content", "")) for m in conv["messages"])
-        for conv in all_conversations
-    )
-    avg_chars = total_chars / max(len(all_conversations), 1)
-    print(f"\nApprox. total chars: {total_chars:,}")
-    print(f"Avg chars/example:  {avg_chars:,.0f}")
-    print(f"Approx avg tokens:  {avg_chars / 4:,.0f}")
-
-    print(f"\nGage IDs: {sorted(stats['gage_ids'])}")
-    print(f"\nOutput written to: {output_path}")
-
-    # Upload to HuggingFace if requested
-    if args.upload:
-        print(f"\nUploading to HuggingFace: {args.hf_repo}")
-        try:
-            from huggingface_hub import HfApi
-            api = HfApi()
-            api.upload_file(
-                path_or_fileobj=str(output_path),
-                path_in_repo="sft_train.jsonl",
-                repo_id=args.hf_repo,
-                repo_type="dataset",
-            )
-            print(f"✓ Uploaded to https://huggingface.co/datasets/{args.hf_repo}")
-        except Exception as e:
-            print(f"Upload failed: {e}")
-            print("You can upload manually later with:")
-            print(f"  huggingface-cli upload {args.hf_repo} {output_path} sft_train.jsonl --repo-type dataset")
+    if args.upload and examples:
+        from huggingface_hub import HfApi
+        import os
+        api = HfApi(token=os.environ.get("HF_TOKEN"))
+        api.upload_file(
+            path_or_fileobj=str(out_path),
+            path_in_repo="sft_train.jsonl",
+            repo_id=args.hf_repo,
+            repo_type="dataset",
+            commit_message="Sequential long-horizon SFT data (no target_nse, NSE-max objective)",
+        )
+        print(f"Uploaded to {args.hf_repo}/sft_train.jsonl")
 
 
 if __name__ == "__main__":

@@ -34,7 +34,11 @@ TRAIN_GAGES = [
     "02294781", "02312000", "07195430", "11043000", "11152000",
     "11179000", "11376000", "11383500", "14207500", "14301000",
 ]
-TEST_GAGES = ["02338660"]
+# Held-out for evaluation. 02338660 is the canonical test gage; the rest
+# are audit-pool gages (01403060) or training swap-outs (06279500 too big,
+# 07144100 too slow under K=8 multi-turn) — kept here so eval.py can run
+# them as out-of-distribution checks.
+TEST_GAGES = ["02338660", "01403060", "06279500", "07144100"]
 ALL_GAGES = TRAIN_GAGES + TEST_GAGES
 
 

@@ -245,15 +245,42 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     # Pattern 1: Hermes XML-style tool calls
     hermes_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
     for match in re.finditer(hermes_pattern, text, re.DOTALL):
+        snippet = match.group(1)
         try:
-            call_data = json.loads(match.group(1))
+            call_data = json.loads(snippet)
             name = call_data.get("name", "")
             arguments = call_data.get("arguments", {})
             if isinstance(arguments, str):
                 arguments = json.loads(arguments)
             tool_calls.append({"name": name, "arguments": arguments})
+            continue
         except json.JSONDecodeError:
-            logger.warning("Failed to parse tool call JSON: %s", match.group(1)[:200])
+            pass
+
+        # Lenient fallback for the common Qwen3 typo on empty-args tools:
+        # `{"name": "run_simulation", "arguments: {}}` (missing closing
+        # quote on `arguments`). Extract `name` via regex; default args = {}.
+        name_m = re.search(r'"name"\s*:\s*"([^"\\]+)"', snippet)
+        if not name_m:
+            logger.warning("Failed to parse tool call JSON: %s", snippet[:200])
+            continue
+        repaired_snippet = re.sub(r'"arguments\s*:\s*\{', '"arguments": {', snippet)
+        try:
+            call_data = json.loads(repaired_snippet)
+            arguments = call_data.get("arguments", {})
+        except json.JSONDecodeError:
+            arguments = {}
+            args_m = re.search(r"'?arguments'?\s*:?\s*(\{[^}]*\})", snippet, re.DOTALL)
+            if args_m:
+                try:
+                    arguments = json.loads(args_m.group(1))
+                except json.JSONDecodeError:
+                    pass
+        tool_calls.append({"name": name_m.group(1), "arguments": arguments})
+        logger.warning(
+            "Repaired malformed tool_call JSON (extracted name=%s, args=%s): %s",
+            name_m.group(1), arguments, snippet[:200],
+        )
 
     # Pattern 2: Direct JSON function calls (fallback)
     if not tool_calls:

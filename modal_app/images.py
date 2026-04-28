@@ -81,11 +81,11 @@ train_image = (
     # invalidate the expensive flash-attn / verl layers above.
     # Bump the SHA + cache-bust suffix when re-uploading data.tar.gz.
     .run_commands(
-        "echo 'hf_dataset_commit=07d7d02f67eebe818c9a193dcd8044ded9350974 cleanup-v4-small-basins'",
+        "echo 'hf_dataset_commit=221a411777e82c788a951e8c2ebf2393ae034785 cleanup-v5-test-gages'",
         "rm -rf /app/data /app/results",
         "wget -qO /tmp/data.tar.gz "
         '"https://huggingface.co/datasets/chrimerss/hydro_cali_agent_example'
-        '/resolve/07d7d02f67eebe818c9a193dcd8044ded9350974/data.tar.gz"',
+        '/resolve/221a411777e82c788a951e8c2ebf2393ae034785/data.tar.gz"',
         "mkdir -p /app/data && tar -xzf /tmp/data.tar.gz -C /app/data",
         # Strip macOS AppleDouble metadata files that get bundled when tar runs
         # on macOS — EF5 tries to parse them as TIFs and hangs.
@@ -159,7 +159,10 @@ sft_image = (
     .add_local_file("control.txt", "/app/data/docs/control.txt")
     .add_local_dir("configs", "/app/configs")
     .add_local_dir("scripts", "/app/scripts")
-    .add_local_dir("data", "/app/data/sft")
+    # Only the JSONL — mounting the entire `data/` dir exceeds Modal's
+    # 125k unique-file mount limit because `data/MRMS_forcing/` has 70+GB
+    # of TIFs that don't belong in the SFT image.
+    .add_local_file("data/sft_train.jsonl", "/app/data/sft/sft_train.jsonl")
 )
 
 

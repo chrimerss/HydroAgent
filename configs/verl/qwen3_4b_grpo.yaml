@@ -37,30 +37,35 @@ data:
 
 actor_rollout_ref:
   model:
+    # Reverted to raw Instruct: SFT on 73 trajectories collapsed the policy
+    # to a deterministic GPT-5-style output (entropy ≈ 0.04, all K=6
+    # rollouts within 150 tokens of each other → zero GRPO advantage). The
+    # raw Instruct model scored NSE=0.60 in baseline eval and has a healthy
+    # multi-modal distribution — better starting point. The A+B+C
+    # anti-collapse settings (high KL, light entropy, temp=1.0) are what
+    # actually prevent catastrophic forgetting.
     path: Qwen/Qwen3-4B-Instruct-2507
     enable_gradient_checkpointing: true
     use_remove_padding: true
     trust_remote_code: true
-    # Full FT (no LoRA) — verl 0.5's SGLang weight transfer can't unwrap
-    # PEFT's `base_model.model.*` prefix; LoRA → SGLang requires merging
-    # weights every rollout step which verl 0.5 doesn't do automatically.
-    # Qwen3-4B + BF16 + FSDP on 4×H100 fits comfortably in memory.
   actor:
     optim:
-      lr: 1.0e-6      # 5e-6 caused step-1 overshoot (pg_loss=-0.5) into a
-                      # degenerate policy that collapsed at step 2; smaller
-                      # lr gives gentler updates so the policy can stay diverse.
+      lr: 1.0e-6
       weight_decay: 0.0
       lr_warmup_steps_ratio: 0.05
     ppo_mini_batch_size: 4
     ppo_micro_batch_size_per_gpu: 1
     use_kl_loss: true
-    kl_loss_coef: 0.001
+    kl_loss_coef: 0.2      # (A) Strong anchor. 0.05 still let the policy
+                           # drift far enough to emit token-level garbage
+                           # ("000000…" spam) by step ~40. 0.2 keeps RL
+                           # very close to the base, which already scores
+                           # NSE=0.6 on the test gage.
     kl_loss_type: low_var_kl
-    entropy_coeff: 0.05    # active exploration — 0.01 wasn't enough, GRPO
-                           # groups still collapsed at step 3 (launch12).
-                           # 0.05 keeps entropy from collapsing too fast on
-                           # this structured tool-call task.
+    entropy_coeff: 0.01    # (B) Light exploration only — SFT distribution
+                           # is already good and multi-modal, so we don't
+                           # need 0.05 entropy bonus pushing it toward
+                           # uniform.
     grad_clip: 1.0
     fsdp_config:
       param_offload: false
@@ -72,13 +77,17 @@ actor_rollout_ref:
                              # registered tool classes in verl 0.5.
     mode: sync
     tensor_model_parallel_size: 1
-    gpu_memory_utilization: 0.55
+    gpu_memory_utilization: 0.45    # 0.55 caused OOM during ref-module init.
+                                    # Actor+ref+optim need ~12GB/GPU after
+                                    # FSDP sharding, plus activations; leave
+                                    # SGLang less so init has headroom.
     n: 6                       # K rollouts per prompt (GRPO group size).
                                # 8 → 6 gives ~25% wall-time reduction with
                                # only mild variance loss; below 4 hurts
                                # GRPO advantage estimation.
-    temperature: 1.2           # >1 for exploration; lowers post-bootstrap
-    top_p: 0.97
+    temperature: 1.0           # (C) Standard sampling; 1.2 destabilized
+                               # post-update distribution.
+    top_p: 0.95
     max_num_batched_tokens: 8192
     free_cache_engine: true
     log_prob_micro_batch_size_per_gpu: 1
@@ -108,5 +117,10 @@ trainer:
                        # Modal function timeout without losing >5h of work.
   test_freq: 25
   total_epochs: 30
-  default_local_dir: /checkpoints/qwen3-4b-grpo
+  # New dir (was qwen3-4b-grpo) so resume_mode=auto doesn't pull the
+  # stale checkpoint from the pre-SFT failed run that's still on the volume.
+  # Resume from the anchored run's step_50 (best A+B+C checkpoint so far).
+  # With resume_mode: auto verl reads latest_checkpointed_iteration.txt and
+  # picks up at step 51 with the new iter-bonus reward + kl=0.2.
+  default_local_dir: /checkpoints/qwen3-4b-grpo-anchored
   resume_mode: auto

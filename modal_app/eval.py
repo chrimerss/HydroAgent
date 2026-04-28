@@ -1,21 +1,27 @@
-"""Modal entrypoint for HydroLLM inference evaluation.
+"""Evaluate a verl GRPO checkpoint OR a stock HuggingFace model with SGLang.
 
-Unified inference script: pass any model ID and the script determines
-whether it's a baseline (base Qwen3-8B) or experiment (SFT/RL fine-tuned).
+Two run kinds:
+  - **experiment** — pass `--checkpoint-path /checkpoints/.../global_step_<N>`.
+    The FSDP shards under `actor/` are merged once via `verl.model_merger`
+    into a `hf_merged/` directory (cached on the Modal volume), then SGLang
+    loads from there.
+  - **baseline**   — pass `--model-id Qwen/Qwen3-4B-Instruct-2507` (or any HF
+    repo id). SGLang downloads + loads from HF hub directly. No merge step.
 
-Usage:
-    # Baseline — raw Qwen3-8B
-    modal run modal_app/eval.py --model-id Qwen/Qwen3-8B
+Default behaviour: run a multi-turn calibration loop on **every gage in
+`configs/gages/` that is NOT in `train_config.yaml`** (the held-out set —
+typically just `02338660` plus any swap-outs). Override with
+`--gage-config <path>` to eval a single gage, or
+`--gage-configs <a.yaml,b.yaml,...>` to eval an explicit list.
 
-    # Experiment — SFT distilled model
-    modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydro-distill
+Output layout in the `hydrollm-results` Modal Volume:
 
-    # Experiment — RL fine-tuned model
-    modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydroLLM
+    /results/<run_kind>/<run_tag>/<gage_id>.json
+    /results/<run_kind>/<run_tag>/_summary.json
 
-    # Custom gage + turns
-    modal run modal_app/eval.py --model-id Qwen/Qwen3-8B \
-        --gage-config configs/gages/02338660.yaml --max-turns 15
+Where `run_tag` is `global_step_<N>` for experiments or the HF model name
+for baselines. Per-gage files contain the full turn trace; `_summary.json`
+collects best/final NSE per gage for quick comparison.
 """
 
 from __future__ import annotations
@@ -23,31 +29,18 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+
 import modal
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-from modal_app.images import eval_image
+from modal_app.images import train_image  # has SGLang + verl + EF5
 
 app = modal.App("hydrollm-eval")
 
 results_vol = modal.Volume.from_name("hydrollm-results", create_if_missing=True)
 checkpoints_vol = modal.Volume.from_name("hydrollm-checkpoints", create_if_missing=True)
 
-# Models treated as "baseline" (no fine-tuning applied)
-BASELINE_MODELS = {
-    "Qwen/Qwen3-8B",
-}
 
-
-def classify_model(model_id: str) -> str:
-    """Classify a model as 'baseline' or 'experiment'."""
-    if model_id in BASELINE_MODELS:
-        return "baseline"
-    return "experiment"
-
-
-# Keys surfaced from the evaluate tool back to the conversation. Only this
-# tool exposes performance metrics — run_simulation intentionally does not.
 _EVALUATE_METRIC_KEYS = (
     "NSE", "CC", "KGE",
     "sim_peak", "obs_peak", "peak_ratio",
@@ -56,296 +49,481 @@ _EVALUATE_METRIC_KEYS = (
 
 
 def _compact_tool_result(tool_name: str, data: dict) -> str:
-    """Return a short summary of tool output for the conversation context."""
     status = data.get("status", "error")
     if status == "error":
         return json.dumps({"status": "error", "message": data.get("message", "")})
-
     if tool_name == "set_parameters":
-        params = data.get("validated_params", {})
-        return json.dumps({"status": "ok", "params": params})
-
+        return json.dumps({"status": "ok", "params": data.get("validated_params", {})})
     if tool_name == "run_simulation":
-        # Intentionally metric-free: forces the agent to call evaluate when
-        # it wants to know how the run performed.
         return json.dumps({
             "status": "ok",
             "run": data.get("run_number"),
             "message": "Simulation complete. Call evaluate to see metrics.",
         })
-
     if tool_name == "evaluate":
         payload = {"status": "ok"}
         for key in _EVALUATE_METRIC_KEYS:
             if key in data:
                 payload[key] = data[key]
         return json.dumps(payload)
-
     return json.dumps({"status": status})
 
 
+def _resolve_checkpoint(checkpoint_path: str) -> str:
+    """If a directory was given without a global_step_N suffix, pick the latest."""
+    p = Path(checkpoint_path)
+    if (p / "actor").is_dir():
+        return str(p)
+    latest = p / "latest_checkpointed_iteration.txt"
+    if latest.exists():
+        step = latest.read_text().strip()
+        return str(p / f"global_step_{step}")
+    raise FileNotFoundError(
+        f"Could not resolve verl checkpoint at {checkpoint_path}; expected "
+        f"either an `actor/` subdir or `latest_checkpointed_iteration.txt`."
+    )
+
+
+def _select_eval_gages(gage_configs: str | None, train_config: str) -> list[str]:
+    """Return the list of gage YAML paths to evaluate.
+
+    Resolution rules (relative to /workspace):
+      - explicit `gage_configs` (comma-separated paths) takes priority.
+      - otherwise: every YAML in `configs/gages/` that is NOT in
+        `train_config.gage_configs`.
+    """
+    repo_root = Path("/workspace")
+    if gage_configs:
+        return [p.strip() for p in gage_configs.split(",") if p.strip()]
+
+    train_yaml = repo_root / train_config
+    train_set: set[str] = set()
+    if train_yaml.exists():
+        import yaml
+        with train_yaml.open() as f:
+            tcfg = yaml.safe_load(f) or {}
+        for path in tcfg.get("gage_configs", []) or []:
+            train_set.add(Path(path).name)  # match by filename
+
+    all_gages = sorted((repo_root / "configs" / "gages").glob("*.yaml"))
+    selected = [
+        str(p.relative_to(repo_root)) for p in all_gages
+        if p.name not in train_set
+    ]
+    return selected
+
+
 @app.function(
-    image=eval_image,
+    image=train_image,
     gpu="H100:1",
-    timeout=7200,  # 2 hours
+    timeout=14400,  # 4h — multi-gage runs need more headroom
     volumes={
         "/results": results_vol,
         "/checkpoints": checkpoints_vol,
     },
     secrets=[modal.Secret.from_name("huggingface")],
     memory=65536,
+    cpu=16.0,
 )
 def run_inference(
-    model_id: str = "Qwen/Qwen3-8B",
-    gage_config: str = "configs/gages/02338660.yaml",
-    max_turns: int = 100,
-    temperature: float = 0.7,
+    checkpoint_path: str | None = None,
+    model_id: str | None = None,
+    gage_config: str | None = None,        # legacy single-gage path
+    gage_configs: str | None = None,       # comma-separated explicit list
+    train_config: str = "configs/train_config.yaml",
+    max_turns: int = 50,
+    temperature: float = 0.0,
     max_tokens: int = 2048,
+    parse_retry_limit: int = 3,
 ):
-    """Run model inference on a calibration task.
+    """Evaluate a verl checkpoint OR HF model on the held-out gage set.
 
-    Automatically classifies the model as baseline or experiment
-    based on the model ID and saves results accordingly.
+    Pass exactly one of:
+        - `checkpoint_path`: a verl GRPO checkpoint dir (FSDP shards are
+          merged to HF format on first run, then cached).
+        - `model_id`: a HuggingFace model id (e.g. `Qwen/Qwen3-4B-Instruct-2507`).
 
-    Args:
-        model_id: HuggingFace model ID (base or fine-tuned).
-        gage_config: Path to gage YAML config.
-        max_turns: Maximum calibration turns.
-        temperature: Sampling temperature for generation.
-        max_tokens: Maximum tokens per generation.
+    Gage selection (in priority order):
+        - `gage_config`: legacy single-gage path (e.g. `configs/gages/02338660.yaml`).
+        - `gage_configs`: comma-separated list of YAML paths.
+        - default: every `configs/gages/*.yaml` not in `train_config.gage_configs`.
     """
     import logging
+    import os
+    import re
+    import subprocess
     import time
+    import uuid
 
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("hydrollm.eval")
 
-    from transformers import AutoTokenizer
-    from vllm import LLM, SamplingParams
+    os.chdir("/workspace")
+    sys.path.insert(0, "/workspace/src")
 
     from hydrollm.config import load_gage_config
     from hydrollm.environment import HydroEnvironment
     from hydrollm.prompts import build_messages
     from hydrollm.tools import HYDRO_TOOLS, ToolExecutor, parse_tool_calls
 
-    # Classify model
-    run_type = classify_model(model_id)
-    model_short = model_id.split("/")[-1]
+    if checkpoint_path and model_id:
+        raise ValueError("Pass either --checkpoint-path OR --model-id, not both.")
+    if not checkpoint_path and not model_id:
+        checkpoint_path = "/checkpoints/qwen3-4b-grpo"
 
-    gcfg = load_gage_config(f"/app/{gage_config}")
+    # 1) Resolve which gages to evaluate.
+    if gage_config:
+        gage_paths = [gage_config]
+    else:
+        gage_paths = _select_eval_gages(gage_configs, train_config)
+    if not gage_paths:
+        raise RuntimeError("No gages selected for evaluation.")
+    logger.info("Evaluating %d gage(s): %s", len(gage_paths), gage_paths)
 
-    logger.info("=" * 60)
-    logger.info("HydroLLM Inference Evaluation")
-    logger.info("Model:     %s", model_id)
-    logger.info("Run type:  %s", run_type.upper())
-    logger.info("Gage:      %s", gcfg.gage_id)
-    logger.info("Max turns: %d", max_turns)
-    logger.info("=" * 60)
+    # 2) Resolve the model path SGLang will load.
+    if model_id:
+        run_kind = "baseline"
+        run_tag = model_id.split("/")[-1]
+        sglang_model_path = model_id
+        logger.info("Baseline HF model: %s", model_id)
+    else:
+        run_kind = "experiment"
+        ckpt_dir = _resolve_checkpoint(checkpoint_path)
+        actor_dir = f"{ckpt_dir}/actor"
+        merged_dir = f"{ckpt_dir}/hf_merged"
+        logger.info("Checkpoint: %s", ckpt_dir)
+        logger.info("Actor:      %s", actor_dir)
+        logger.info("Merged HF:  %s", merged_dir)
 
-    # Load tokenizer + model
-    logger.info("Loading model %s ...", model_id)
+        safetensors_marker = Path(merged_dir) / "model.safetensors.index.json"
+        single_safetensors = Path(merged_dir) / "model.safetensors"
+        if not (safetensors_marker.exists() or single_safetensors.exists()):
+            logger.info("Merging FSDP shards via `python -m verl.model_merger` ...")
+            Path(merged_dir).mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    "python", "-m", "verl.model_merger", "merge",
+                    "--backend", "fsdp",
+                    "--local_dir", actor_dir,
+                    "--target_dir", merged_dir,
+                ],
+                check=True,
+            )
+            checkpoints_vol.commit()
+        else:
+            logger.info("Reusing existing merged HF model at %s", merged_dir)
+        run_tag = Path(ckpt_dir).name  # e.g. global_step_50
+        sglang_model_path = merged_dir
+
+    # 3) Output dir: /results/<run_kind>/<run_tag>/
+    out_dir = Path("/results") / run_kind / run_tag
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 4) Boot SGLang once and reuse across gages.
+    import sglang as sgl
+    from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(
-        model_id,
+        sglang_model_path, trust_remote_code=True, extra_special_tokens={},
+    )
+    logger.info("Starting SGLang engine ...")
+    engine = sgl.Engine(
+        model_path=sglang_model_path,
+        tokenizer_path=sglang_model_path,
         trust_remote_code=True,
-        extra_special_tokens={},  # Workaround for Qwen tokenizer save bug (list vs dict)
+        tool_call_parser="hermes",
+        mem_fraction_static=0.85,
+        log_level="warning",
     )
 
-    llm = LLM(
-        model=model_id,
-        trust_remote_code=True,
-        max_model_len=8192,
+    sampling_params = {
+        "temperature": temperature,
+        "max_new_tokens": max_tokens,
+        "stop": ["<|im_end|>"],
+    }
+    max_prompt_tokens = 8192 - max_tokens
+
+    _RETRY_HINT = (
+        "Your previous response could not be parsed as a valid tool call. "
+        "Re-emit your tool call exactly in this format and nothing else:\n"
+        "<tool_call>\n"
+        '{"name": "<tool_name>", "arguments": {<json_arguments>}}\n'
+        "</tool_call>"
     )
-    sampling_params = SamplingParams(
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stop=["<|im_end|>"],
-    )
 
-    # Initialize environment and conversation
-    env = HydroEnvironment(gcfg)
-    executor = ToolExecutor(env)
-    messages = build_messages(gcfg)
-
-    parameter_trajectory = []
-    valid_tool_calls = 0
-    invalid_tool_calls = 0
-    turn_details = []
-    start_time = time.time()
-
-    max_prompt_tokens = 8192 - max_tokens  # reserve room for the completion
+    summary: list[dict] = []
 
     try:
-        for turn in range(max_turns):
-            logger.info("Turn %d/%d", turn + 1, max_turns)
+        for gpath in gage_paths:
+            full_path = gpath if gpath.startswith("/") else f"/workspace/{gpath}"
+            try:
+                gcfg = load_gage_config(full_path)
+            except Exception as e:
+                logger.error("Failed to load %s: %s — skipping", gpath, e)
+                continue
 
-            # Apply chat template with tool definitions
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tools=HYDRO_TOOLS,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+            logger.info("=" * 60)
+            logger.info("HydroLLM SGLang Eval — gage %s", gcfg.gage_id)
+            logger.info("Run kind=%s  Run tag=%s  Max turns=%d", run_kind, run_tag, max_turns)
+            logger.info("=" * 60)
 
-            # Trim oldest mid-conversation turns if prompt exceeds context budget
-            prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False))
-            while prompt_len > max_prompt_tokens and len(messages) > 2:
-                messages.pop(1)  # drop oldest turn after system message
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    tools=HYDRO_TOOLS,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False))
+            env = HydroEnvironment(gcfg)
+            executor = ToolExecutor(env)
+            messages = build_messages(gcfg)
 
-            # Generate
-            outputs = llm.generate(prompt, sampling_params)
-            assistant_message = outputs[0].outputs[0].text
+            parameter_trajectory: list[dict] = []
+            valid_tool_calls = 0
+            invalid_tool_calls = 0
+            turn_details: list[dict] = []
+            parse_failures = 0
+            start = time.time()
 
-            # Parse tool calls
-            tool_calls = parse_tool_calls(assistant_message)
+            try:
+                for turn in range(max_turns):
+                    logger.info("[%s] Turn %d/%d", gcfg.gage_id, turn + 1, max_turns)
+                    prompt = tokenizer.apply_chat_template(
+                        messages, tools=HYDRO_TOOLS, tokenize=False, add_generation_prompt=True,
+                    )
+                    plen = len(tokenizer.encode(prompt, add_special_tokens=False))
+                    while plen > max_prompt_tokens and len(messages) > 2:
+                        messages.pop(1)
+                        prompt = tokenizer.apply_chat_template(
+                            messages, tools=HYDRO_TOOLS, tokenize=False, add_generation_prompt=True,
+                        )
+                        plen = len(tokenizer.encode(prompt, add_special_tokens=False))
 
-            if not tool_calls:
-                messages.append({"role": "assistant", "content": assistant_message})
-                logger.info("No tool calls in turn %d, ending conversation", turn + 1)
-                turn_details.append({
-                    "turn": turn + 1,
-                    "action": "no_tool_call",
-                    "response_preview": assistant_message,
-                })
-                break
+                    outputs = engine.generate([prompt], sampling_params)
+                    assistant_message = outputs[0]["text"]
+                    tool_calls = parse_tool_calls(assistant_message)
 
-            import uuid
-            import re
-            
-            # Extract reasoning by removing the tool call blocks
-            reasoning = re.sub(r"<tool_call>.*?</tool_call>", "", assistant_message, flags=re.DOTALL).strip()
-            
-            # If the model used the raw json format without <tool_call>, strip that too
-            json_pattern = r'\{"name"\s*:\s*"\w+"\s*,\s*"arguments"\s*:\s*\{.*?\}\}'
-            reasoning = re.sub(json_pattern, "", reasoning, flags=re.DOTALL).strip()
+                    if not tool_calls:
+                        messages.append({"role": "assistant", "content": assistant_message})
+                        turn_details.append({
+                            "turn": turn + 1,
+                            "action": "parse_failure",
+                            "response_preview": assistant_message[:500],
+                        })
+                        parse_failures += 1
+                        if parse_failures > parse_retry_limit:
+                            logger.info(
+                                "[%s] Parse failed %d times (>%d), ending.",
+                                gcfg.gage_id, parse_failures, parse_retry_limit,
+                            )
+                            break
+                        logger.info(
+                            "[%s] Parse failed (%d/%d) — appending retry hint.",
+                            gcfg.gage_id, parse_failures, parse_retry_limit,
+                        )
+                        messages.append({"role": "user", "content": _RETRY_HINT})
+                        continue
+                    parse_failures = 0
 
-            openai_tool_calls = []
-            for call in tool_calls:
-                call_id = f"call_{uuid.uuid4().hex[:8]}"
-                call["id"] = call_id
-                args_dict = call["arguments"] if isinstance(call["arguments"], dict) else json.loads(call["arguments"])
-                openai_tool_calls.append({
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": call["name"],
-                        "arguments": args_dict
-                    }
-                })
+                    reasoning = re.sub(r"<tool_call>.*?</tool_call>", "", assistant_message, flags=re.DOTALL).strip()
+                    json_pattern = r'\{"name"\s*:\s*"\w+"\s*,\s*"arguments"\s*:\s*\{.*?\}\}'
+                    reasoning = re.sub(json_pattern, "", reasoning, flags=re.DOTALL).strip()
 
-            messages.append({
-                "role": "assistant",
-                "content": reasoning,
-                "tool_calls": openai_tool_calls
+                    openai_tool_calls = []
+                    for call in tool_calls:
+                        cid = f"call_{uuid.uuid4().hex[:8]}"
+                        call["id"] = cid
+                        args_dict = call["arguments"] if isinstance(call["arguments"], dict) else json.loads(call["arguments"])
+                        openai_tool_calls.append({
+                            "id": cid,
+                            "type": "function",
+                            "function": {"name": call["name"], "arguments": args_dict},
+                        })
+
+                    messages.append({
+                        "role": "assistant",
+                        "content": reasoning,
+                        "tool_calls": openai_tool_calls,
+                    })
+
+                    for call in tool_calls:
+                        tool_name = call["name"]
+                        tool_args = call["arguments"]
+                        logger.info("[%s] Executing %s ...", gcfg.gage_id, tool_name)
+                        result_str = executor.execute(tool_name, tool_args)
+                        result_data = json.loads(result_str)
+
+                        if result_data.get("status") == "error":
+                            invalid_tool_calls += 1
+                        else:
+                            valid_tool_calls += 1
+                        if tool_name == "set_parameters" and result_data.get("status") == "ok":
+                            parameter_trajectory.append(result_data.get("validated_params", {}))
+
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "name": tool_name,
+                            "content": _compact_tool_result(tool_name, result_data),
+                        })
+
+                        entry = {"turn": turn + 1, "tool": tool_name}
+                        if tool_name == "evaluate" and result_data.get("status") == "ok":
+                            for k in _EVALUATE_METRIC_KEYS:
+                                if k in result_data:
+                                    entry[k] = result_data[k]
+                        turn_details.append(entry)
+            finally:
+                elapsed = time.time() - start
+                env.cleanup()
+
+            nse_hist = env.nse_history
+            best_nse = max(nse_hist) if nse_hist else None
+
+            result = {
+                "run_kind": run_kind,
+                "run_tag": run_tag,
+                "model_id": model_id,
+                "checkpoint_path": checkpoint_path,
+                "sglang_model_path": sglang_model_path,
+                "gage_id": gcfg.gage_id,
+                "temperature": temperature,
+                "final_nse": nse_hist[-1] if nse_hist else None,
+                "best_nse": round(best_nse, 4) if best_nse is not None else None,
+                "nse_history": [round(n, 4) for n in nse_hist],
+                "num_turns": len(turn_details),
+                "num_simulation_runs": env.run_count,
+                "valid_tool_calls": valid_tool_calls,
+                "invalid_tool_calls": invalid_tool_calls,
+                "parse_failures_total": parse_failures,
+                "parameter_trajectory": parameter_trajectory,
+                "target_nse": gcfg.target_nse,
+                "target_met": best_nse is not None and best_nse > gcfg.target_nse,
+                "elapsed_seconds": round(elapsed, 1),
+                "turn_details": turn_details,
+            }
+
+            out_path = out_dir / f"{gcfg.gage_id}.json"
+            out_path.write_text(json.dumps(result, indent=2, default=str))
+            results_vol.commit()
+            summary.append({
+                "gage_id": gcfg.gage_id,
+                "best_nse": result["best_nse"],
+                "final_nse": result["final_nse"],
+                "num_simulation_runs": result["num_simulation_runs"],
+                "elapsed_seconds": result["elapsed_seconds"],
+                "target_met": result["target_met"],
+                "path": str(out_path),
             })
 
-            # Execute each tool call
-            for call in tool_calls:
-                tool_name = call["name"]
-                tool_args = call["arguments"]
-
-                logger.info("Executing tool: %s", tool_name)
-                result_str = executor.execute(tool_name, tool_args)
-
-                result_data = json.loads(result_str)
-                if result_data.get("status") == "error":
-                    invalid_tool_calls += 1
-                else:
-                    valid_tool_calls += 1
-
-                if tool_name == "set_parameters" and result_data.get("status") == "ok":
-                    parameter_trajectory.append(result_data.get("validated_params", {}))
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "name": tool_name,
-                    "content": _compact_tool_result(tool_name, result_data),
-                })
-
-                turn_entry = {"turn": turn + 1, "tool": tool_name}
-                if tool_name == "evaluate" and result_data.get("status") == "ok":
-                    for key in _EVALUATE_METRIC_KEYS:
-                        if key in result_data:
-                            turn_entry[key] = result_data[key]
-                turn_details.append(turn_entry)
+            logger.info(
+                "[%s] best_nse=%s  sim_runs=%d  elapsed=%.1fs",
+                gcfg.gage_id, result["best_nse"],
+                result["num_simulation_runs"], elapsed,
+            )
 
     finally:
-        elapsed = time.time() - start_time
-        env.cleanup()
+        try:
+            engine.shutdown()
+        except Exception:
+            pass
 
-    nse_hist = env.nse_history
-    best_nse = max(nse_hist) if nse_hist else None
-
-    result = {
-        "model": model_id,
-        "run_type": run_type,
-        "gage_id": gcfg.gage_id,
-        "final_nse": nse_hist[-1] if nse_hist else None,
-        "best_nse": round(best_nse, 4) if best_nse is not None else None,
-        "nse_history": [round(n, 4) for n in nse_hist],
-        "num_turns": len(turn_details),
-        "num_simulation_runs": env.run_count,
-        "valid_tool_calls": valid_tool_calls,
-        "invalid_tool_calls": invalid_tool_calls,
-        "parameter_trajectory": parameter_trajectory,
-        "target_nse": gcfg.target_nse,
-        "target_met": best_nse is not None and best_nse > gcfg.target_nse,
-        "elapsed_seconds": round(elapsed, 1),
-        "turn_details": turn_details,
+    summary_doc = {
+        "run_kind": run_kind,
+        "run_tag": run_tag,
+        "model_id": model_id,
+        "checkpoint_path": checkpoint_path,
+        "n_gages": len(summary),
+        "results": summary,
     }
-
-    # Save results
-    output_path = f"/results/{run_type}_{model_short}_{gcfg.gage_id}.json"
-    with open(output_path, "w") as f:
-        json.dump(result, f, indent=2, default=str)
-
+    (out_dir / "_summary.json").write_text(json.dumps(summary_doc, indent=2, default=str))
     results_vol.commit()
 
-    logger.info("-" * 60)
-    logger.info("Run type:    %s", run_type.upper())
-    logger.info("Best NSE:    %s", result["best_nse"])
-    logger.info("Target NSE:  %s", gcfg.target_nse)
-    logger.info("Target met:  %s", result["target_met"])
-    logger.info("Turns:       %d", result["num_turns"])
-    logger.info("Elapsed:     %.1fs", elapsed)
-    logger.info("Saved to:    %s", output_path)
-    logger.info("-" * 60)
+    logger.info("=" * 60)
+    logger.info("Eval done. %d gage(s) → %s", len(summary), out_dir)
+    for r in summary:
+        logger.info("  %s  best_nse=%s  sim_runs=%d", r["gage_id"], r["best_nse"], r["num_simulation_runs"])
+    return summary_doc
 
-    return result
+
+def _download_results_to_host(summary: dict, local_root: str = "results") -> None:
+    """Pull per-gage JSON + _summary.json from the Modal volume to the host.
+
+    Mirrors the volume layout: `<local_root>/<run_kind>/<run_tag>/<gage_id>.json`.
+    """
+    vol = modal.Volume.from_name("hydrollm-results")
+    run_kind = summary.get("run_kind", "unknown")
+    run_tag = summary.get("run_tag", "unknown")
+    out_dir = Path(local_root) / run_kind / run_tag
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _pull(remote_rel: str, local_path: Path) -> None:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with local_path.open("wb") as f:
+            for chunk in vol.read_file(remote_rel):
+                f.write(chunk)
+
+    # Per-gage JSONs.
+    for entry in summary.get("results", []):
+        remote_abs = entry.get("path", "")
+        rel = remote_abs.lstrip("/")
+        if rel.startswith("results/"):
+            rel = rel[len("results/"):]
+        if not rel:
+            continue
+        gage_id = entry.get("gage_id", "result")
+        _pull(rel, out_dir / f"{gage_id}.json")
+
+    # Roll-up summary.
+    summary_rel = f"{run_kind}/{run_tag}/_summary.json"
+    _pull(summary_rel, out_dir / "_summary.json")
+
+    print(f"Saved {len(summary.get('results', []))} per-gage JSON(s) + _summary.json to {out_dir}/")
 
 
 @app.local_entrypoint()
 def main(
-    model_id: str = "Qwen/Qwen3-8B",
-    gage_config: str = "configs/gages/02338660.yaml",
-    max_turns: int = 100,
-    temperature: float = 0.7,
+    checkpoint_path: str = "",
+    model_id: str = "",
+    gage_config: str = "",
+    gage_configs: str = "",
+    train_config: str = "configs/train_config.yaml",
+    max_turns: int = 50,
+    temperature: float = 0.0,
     max_tokens: int = 2048,
+    parse_retry_limit: int = 3,
+    download_dir: str = "results",
 ):
-    """Run inference evaluation on Modal.
+    """Run an SGLang eval on the held-out gage set.
+
+    Each per-gage JSON contains the full trajectory in `turn_details` (every
+    set_parameters / run_simulation / evaluate call with the NSE value at
+    each evaluate). After the remote run returns, all per-gage JSONs plus
+    `_summary.json` are downloaded into `./<download_dir>/<run_kind>/<run_tag>/`
+    on the host.
 
     Examples:
-        # Baseline
-        modal run modal_app/eval.py --model-id Qwen/Qwen3-8B
+        # Default: latest verl checkpoint, all non-training gages
+        modal run modal_app/eval.py
 
-        # SFT experiment
-        modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydro-distill
+        # Specific verl step, all non-training gages
+        modal run modal_app/eval.py \
+            --checkpoint-path /checkpoints/qwen3-4b-grpo-anchored/global_step_50
 
-        # RL experiment
-        modal run modal_app/eval.py --model-id chrimerss/Qwen-3-8B-hydroLLM
+        # Baseline HF model, all non-training gages
+        modal run modal_app/eval.py --model-id Qwen/Qwen3-4B-Instruct-2507
+
+        # Single gage override (e.g. the canonical test gage)
+        modal run modal_app/eval.py --gage-config configs/gages/02338660.yaml
     """
-    result = run_inference.remote(
-        model_id=model_id,
-        gage_config=gage_config,
+    summary = run_inference.remote(
+        checkpoint_path=checkpoint_path or None,
+        model_id=model_id or None,
+        gage_config=gage_config or None,
+        gage_configs=gage_configs or None,
+        train_config=train_config,
         max_turns=max_turns,
         temperature=temperature,
         max_tokens=max_tokens,
+        parse_retry_limit=parse_retry_limit,
     )
-    print(json.dumps(result, indent=2, default=str))
+    print(json.dumps(summary, indent=2, default=str))
+
+    try:
+        _download_results_to_host(summary, local_root=download_dir)
+    except Exception as e:
+        print(f"WARNING: result download failed ({e}); pull manually with "
+              f"`modal volume get hydrollm-results <run_kind>/<run_tag>/`.")

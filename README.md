@@ -70,10 +70,10 @@ HydroLLM/
 │   └── baseline.py             # Base model inference evaluator
 │
 ├── modal_app/                  # Modal serverless deployment
-│   ├── images.py               # train_image (verl/SGLang), sft_image, eval_image
+│   ├── images.py               # train_image (verl/SGLang/EF5), sft_image
 │   ├── sft.py                  # SFT training entrypoint (legacy TRL)
 │   ├── train.py                # verl GRPO training entrypoint
-│   └── eval.py                 # Unified inference evaluation
+│   └── eval.py                 # SGLang multi-turn eval (HF model OR verl ckpt)
 │
 ├── configs/
 │   ├── sft_config.yaml         # SFT hyperparameters (legacy)
@@ -148,13 +148,17 @@ modal secret create huggingface HF_TOKEN=your_hf_token
 
 ### 3. Run Baseline Evaluation
 
-Evaluate the base model _before_ training to establish the performance floor:
+Evaluate the base model _before_ training to establish the performance floor.
+This runs SGLang inference + a multi-turn calibration loop on the held-out
+test gage (`02338660`) — same protocol used to evaluate trained checkpoints,
+so results are directly comparable.
 
 ```bash
 modal run modal_app/eval.py --model-id Qwen/Qwen3-4B-Instruct-2507
 ```
 
-Results are saved to the `hydrollm-results` Modal Volume.
+Result is saved to `hydrollm-results/sglang_baseline_Qwen3-4B-Instruct-2507_02338660.json`
+on the `hydrollm-results` Modal Volume.
 
 ### 4. RL Training (verl GRPO + SGLang on 4×H100)
 
@@ -219,15 +223,46 @@ The SFT path predates the verl RL path and uses the original Qwen3-8B + LoRA + T
 
 ### 6. Evaluate
 
+`modal_app/eval.py` runs an SGLang-based multi-turn calibration loop. **Default behavior: it loops over every gage in `configs/gages/` that is NOT in `configs/train_config.yaml`** — i.e., the held-out test set. It accepts either a HuggingFace model id (baseline) or a verl checkpoint path (experiment):
+
 ```bash
-# Baseline
+# Baseline — stock HuggingFace model on all held-out gages
 modal run modal_app/eval.py --model-id Qwen/Qwen3-4B-Instruct-2507
 
-# RL-trained checkpoint
-modal run modal_app/eval.py --model-id <your_hf_repo_or_local_volume_path>
+# Experiment — latest verl GRPO checkpoint
+modal run modal_app/eval.py
+
+# Experiment — pin to a specific step
+modal run modal_app/eval.py --checkpoint-path /checkpoints/qwen3-4b-grpo-anchored/global_step_50
+
+# Single-gage override
+modal run modal_app/eval.py --gage-config configs/gages/02338660.yaml
 ```
 
-Results are tagged as `baseline` or `experiment` and saved to the `hydrollm-results` Modal Volume.
+Eval defaults to **greedy decoding** (`temperature=0.0`) for reproducibility. On `<tool_call>` parse failure the loop retries up to 3 times with a "re-emit valid JSON" hint before giving up.
+
+Results are saved to the `hydrollm-results` Modal Volume in a per-step directory layout:
+
+```
+/results/
+├── baseline/
+│   └── Qwen3-4B-Instruct-2507/
+│       ├── 02338660.json
+│       ├── 01403060.json   # if shipped in data.tar.gz
+│       └── _summary.json
+└── experiment/
+    └── global_step_50/
+        ├── 02338660.json
+        └── _summary.json
+```
+
+Pull a result locally with:
+
+```bash
+modal volume ls hydrollm-results experiment/global_step_50
+modal volume get hydrollm-results experiment/global_step_50/02338660.json ./
+modal volume get hydrollm-results experiment/global_step_50/_summary.json ./
+```
 
 ## Local Development
 
@@ -258,20 +293,50 @@ Hydra overlay on top of verl's `ppo_trainer` defaults. Key knobs:
 | `algorithm.adv_estimator` | `grpo` | GRPO (group-relative advantages) |
 | `data.train_batch_size` | 4 | Prompts per step (×K=8 rollouts → 32 trajectories per step) |
 | `actor_rollout_ref.rollout.n` | 6 | K rollouts per prompt (GRPO group size) |
-| `actor_rollout_ref.rollout.temperature` | 1.2 | Sampling temperature (>1 for exploration) |
-| `actor_rollout_ref.rollout.top_p` | 0.97 | Nucleus sampling top-p |
+| `actor_rollout_ref.rollout.temperature` | 1.0 | Sampling temperature |
+| `actor_rollout_ref.rollout.top_p` | 0.95 | Nucleus sampling top-p |
 | `actor_rollout_ref.rollout.multi_turn.max_assistant_turns` | 50 | Max calibration rounds per rollout |
-| `actor_rollout_ref.actor.optim.lr` | 1e-6 | Actor learning rate (5e-6 caused mode collapse) |
+| `actor_rollout_ref.actor.optim.lr` | 1e-6 | Actor learning rate (5e-6 caused overshoot/collapse) |
 | `actor_rollout_ref.actor.optim.lr_warmup_steps_ratio` | 0.05 | LR warmup over first 5% of steps |
-| `actor_rollout_ref.actor.entropy_coeff` | 0.05 | Entropy bonus — prevents GRPO group collapse |
-| `actor_rollout_ref.actor.kl_loss_coef` | 0.001 | KL penalty (low — leans on multi-turn variance) |
+| `actor_rollout_ref.actor.entropy_coeff` | 0.01 | Light entropy bonus — base distribution is already multi-modal |
+| `actor_rollout_ref.actor.kl_loss_coef` | 0.2 | Strong anchor to base policy — prevents catastrophic forgetting / token-level degeneration |
 | `data.max_response_length` | 4096 | Max tokens per assistant turn |
 | `trainer.total_epochs` | 30 | Training epochs |
 | `trainer.save_freq` | 10 | Checkpoint cadence (steps) — first save lands ~5h in |
 | `trainer.test_freq` | 25 | Validation cadence (steps) |
 | `trainer.n_gpus_per_node` | 4 | GPUs (single Modal container) |
 
-### Adding New Gages (Phase 2)
+### Gages — training vs testing
+
+Selected by `scripts/audit_flood_windows.py`, which slides a 60-day window over each gage's observation series and scores by `log10(peak/median + 1) × sqrt(rise_h × rec_h)`. Each window is a clear flood event (rising + receding limbs, edge-buffered). Two of the originally selected gages (`06279500` at 40792 km², `07144100` at 3209 km²) were swapped out after EF5 timeouts under K=8 multi-turn rollouts; replaced with smaller-basin candidates from the audit drop-pool.
+
+**Training set (10 gages — `configs/train_config.yaml`)**:
+
+| Gage ID | Basin (km²) | Window (UTC) |
+|---|---:|---|
+| 11383500 | 539 | 2018-05-19 → 2018-07-17 |
+| 11043000 | 575 | 2019-03-15 → 2019-05-13 |
+| 11152000 | 632 | 2018-05-29 → 2018-07-27 |
+| 02294781 | 1064 | 2018-04-29 → 2018-06-27 |
+| 02312000 | 1476 | 2018-11-15 → 2019-01-13 |
+| 07195430 | 1489 | 2018-01-04 → 2018-03-04 |
+| 11179000 | 1639 | 2018-06-03 → 2018-08-01 |
+| 14301000 | 1727 | 2018-09-11 → 2018-11-09 |
+| 14207500 | 1828 | 2018-04-09 → 2018-06-07 |
+| 11376000 | 2401 | 2018-09-21 → 2018-11-19 |
+
+**Testing set** (held out — used only by `modal_app/eval.py`):
+
+| Gage ID | Basin (km²) | Notes |
+|---|---:|---|
+| 02338660 | 329 | canonical test gage; in current `data.tar.gz` |
+| 01403060 | 2033 | not in current `data.tar.gz` (audit drop-pool) |
+| 06279500 | 40792 | swapped out of training (too slow); not in current tarball |
+| 07144100 | 3209 | swapped out of training; not in current tarball |
+
+`modal_app/eval.py` defaults to evaluating every gage in `configs/gages/` that is **not** in `train_config.gage_configs`. Currently only `02338660` has data shipped in the image — the others fail at EF5 (no MRMS clip) until you regenerate `data.tar.gz` to include them.
+
+### Adding New Gages
 
 1. Create a YAML file in `configs/gages/`:
    ```yaml
@@ -279,20 +344,20 @@ Hydra overlay on top of verl's `ppo_trainer` defaults. Key knobs:
    lon: -78.1234
    lat: 38.5678
    basin_area: 500.0
-   obs_dir: /app/data/gauge_observations
+   obs_dir: /app/data/gauge
    control_template: /app/data/docs/control.txt
    time_begin: "201807010000"
    time_end: "201808312300"
-   target_nse: 0.8
+   target_nse: 0.7
+   ef5_timeout: 300
    ```
 
-2. Add data (precipitation, PET, observations) to the Docker image or Modal Volume
+2. Add the gage_id to `scripts/build_data_tarball.py:TRAIN_GAGES` and re-run that script + the upload + bump the SHA in `modal_app/images.py` (see "Updating the data tarball" above).
 
-3. Add the config path to `train_config.yaml`:
+3. Add the config path to `configs/train_config.yaml`:
    ```yaml
    gage_configs:
-     - configs/gages/02338660.yaml
-     - configs/gages/01632000.yaml
+     - configs/gages/<gage_id>.yaml
    ```
 
 ## Reward Function
@@ -303,21 +368,20 @@ Two layers of signal: **per-turn** (returned by tools) and **terminal** (returne
 
 | Tool call | Reward | Purpose |
 |-----------|--------|---------|
-| `set_parameters` (valid) | `+0.02` | Densify per-turn signal; reward protocol step |
+| `set_parameters` (valid) | `+0.02` | Format/protocol bonus |
 | `run_simulation` (valid) | `+0.05` | Slightly higher: produces the artifact to evaluate |
 | `evaluate` (valid) | `ΔNSE` | Real progress signal (this turn's NSE − previous) |
 | Any tool (invalid) | `−0.5` | Format penalty |
-
-Per-trajectory format-bonus is implicitly capped via `max_assistant_turns=10` (≈ +0.5 max).
 
 **Terminal (in `src/hydrollm/verl_reward.py`):**
 
 | Component | Value | Purpose |
 |-----------|-------|---------|
-| Best NSE | `[-1, 1]` | Primary signal (clipped) |
-| Target bonus | `+0.5` | NSE exceeds gage's `target_nse` |
-| Efficiency penalty | `-0.02` | Per evaluate call |
-| Empty-trajectory penalty | `-1.0` | No NSE produced at all |
+| Best NSE | `[−1, 1]` | Primary signal, clipped |
+| Target bonus | `+0.5` | If best NSE > gage's `target_nse` |
+| Per-evaluate **bonus** | `+0.02 × n_evaluates` | Encourages sustained iteration (replaces the earlier `-0.02` efficiency penalty, which had taught the agent to exit after one round) |
+| Improvement bonus | `+0.10 × max(0, n_improvements − 1)` | Each evaluate that beat the running best — explicitly trains "iterate until you can't improve" |
+| Empty-trajectory penalty | `−1.0` | Agent never produced a parseable evaluate result |
 
 ## Tools
 
@@ -369,6 +433,10 @@ If you use HydroLLM in your research, please cite:
   url={https://github.com/chrimerss/HydroLLM}
 }
 ```
+
+## Acknowledgement
+
+We appreciate **Modal** for sponsoring computing credits for this research.
 
 ## License
 

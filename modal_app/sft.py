@@ -8,7 +8,7 @@ HuggingFace as chrimerss/Qwen-3-8B-hydro-distill.
 
 Usage:
     modal run modal_app/sft.py
-    modal run modal_app/sft.py --model-config configs/models/qwen3_8b_sft.yaml
+    modal run modal_app/sft.py --model-config configs/models/qwen3_4b_sft.yaml
     modal run modal_app/sft.py --dry-run  # Verify setup without training
 """
 
@@ -36,7 +36,7 @@ checkpoint_vol = modal.Volume.from_name("hydrollm-checkpoints", create_if_missin
     memory=65536,  # 64 GiB system RAM
 )
 def train_sft(
-    model_config: str = "configs/models/qwen3_8b_sft.yaml",
+    model_config: str = "configs/models/qwen3_4b_sft.yaml",
     sft_config: str = "configs/sft_config.yaml",
     dry_run: bool = False,
 ):
@@ -81,7 +81,7 @@ _do_train('{model_config}', '{sft_config}', {dry_run})
 
 
 def _do_train(
-    model_config: str = "configs/models/qwen3_8b_sft.yaml",
+    model_config: str = "configs/models/qwen3_4b_sft.yaml",
     sft_config: str = "configs/sft_config.yaml",
     dry_run: bool = False,
 ):
@@ -305,7 +305,7 @@ def _do_train(
 
 @app.local_entrypoint()
 def main(
-    model_config: str = "configs/models/qwen3_8b_sft.yaml",
+    model_config: str = "configs/models/qwen3_4b_sft.yaml",
     sft_config: str = "configs/sft_config.yaml",
     dry_run: bool = False,
 ):

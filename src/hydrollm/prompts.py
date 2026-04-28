@@ -40,7 +40,9 @@ process at a time (peak, volume, timing). Stop when NSE > target.\
 def build_user_prompt(gage_config: GageConfig) -> str:
     """Build the user prompt for a specific gage.
 
-    Includes watershed metadata, parameter ranges, and objective.
+    Includes watershed metadata and parameter ranges. The objective
+    intentionally does NOT include a target NSE — the agent should aim
+    to maximize NSE for as long as it can find further improvements.
     """
     # Build parameter table
     param_lines = []
@@ -59,7 +61,9 @@ Watershed Information:
 - Evaluation period: {_format_time(gage_config.time_begin)} to \
 {_format_time(gage_config.time_end)}
 
-Objective: Achieve NSE > {gage_config.target_nse}
+Objective: Maximize NSE as much as possible. Iterate as many calibration \
+rounds as needed — keep adjusting parameters as long as you can find further \
+improvements.
 
 Tunable Parameters (name: [min, max]):
 {param_table}

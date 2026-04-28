@@ -1,24 +1,26 @@
-# SFT hyperparameters for distillation from GPT-4o calibration trajectories
-# Used by modal_app/sft.py
+# SFT hyperparameters — long-horizon distillation from GPT-5 trajectories.
+# Used by modal_app/sft.py.
 
 # Training
-num_train_epochs: 1
-per_device_train_batch_size: 2
+num_train_epochs: 3
+per_device_train_batch_size: 1
 gradient_accumulation_steps: 8
-learning_rate: 2.0e-5
+learning_rate: 1.0e-5
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
-max_seq_length: 4096
+# Long-horizon trajectories — keep room for the longest sample
+# (~20 rounds × ~2k tokens each ~ 16k tokens).
+max_seq_length: 16384
 bf16: true
 
 # Logging
 logging_steps: 5
 save_steps: 100
 report_to: wandb
-run_name: "hydrollm-sft-distill"
+run_name: "hydrollm-sft-qwen3-4b"
 
 # Output
-hf_repo_id: "chrimerss/Qwen-3-8B-hydro-distill"
+hf_repo_id: "chrimerss/Qwen3-4B-hydro-sft"
 
 # Data
 sft_data_path: "data/sft_train.jsonl"
