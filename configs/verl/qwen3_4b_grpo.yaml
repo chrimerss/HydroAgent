@@ -56,11 +56,10 @@ actor_rollout_ref:
     ppo_mini_batch_size: 4
     ppo_micro_batch_size_per_gpu: 1
     use_kl_loss: true
-    kl_loss_coef: 0.2      # (A) Strong anchor. 0.05 still let the policy
-                           # drift far enough to emit token-level garbage
-                           # ("000000…" spam) by step ~40. 0.2 keeps RL
-                           # very close to the base, which already scores
-                           # NSE=0.6 on the test gage.
+    kl_loss_coef: 0.05     # (A) The anchor that produced the working
+                           # step_50 (NSE=0.544 on 02338660). Sticking to
+                           # this since it is the configuration that
+                           # actually trained productively for 50 steps.
     kl_loss_type: low_var_kl
     entropy_coeff: 0.01    # (B) Light exploration only — SFT distribution
                            # is already good and multi-modal, so we don't

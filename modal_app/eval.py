@@ -131,7 +131,7 @@ def run_inference(
     gage_config: str | None = None,        # legacy single-gage path
     gage_configs: str | None = None,       # comma-separated explicit list
     train_config: str = "configs/train_config.yaml",
-    max_turns: int = 50,
+    max_turns: int = 100,
     temperature: float = 0.0,
     max_tokens: int = 2048,
     parse_retry_limit: int = 3,
