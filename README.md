@@ -327,12 +327,12 @@ Selected by `scripts/audit_flood_windows.py`, which slides a 60-day window over 
 
 **Testing set** (held out — used only by `modal_app/eval.py`):
 
-| Gage ID | Basin (km²) | Notes |
+| Gage ID | Basin (km²) | Window (UTC) |
 |---|---:|---|
-| 02338660 | 329 | canonical test gage; in current `data.tar.gz` |
-| 01403060 | 2033 | not in current `data.tar.gz` (audit drop-pool) |
-| 06279500 | 40792 | swapped out of training (too slow); not in current tarball |
-| 07144100 | 3209 | swapped out of training; not in current tarball |
+| 02338660 | 329 | 2018-07-01 → 2018-08-31 |
+| 01403060 | 2033 | 2018-11-11 → 2019-01-09 |
+| 06279500 | 40792 | 2018-06-13 → 2018-08-11 |
+| 07144100 | 3209 | 2019-03-30 → 2019-05-28 |
 
 `modal_app/eval.py` defaults to evaluating every gage in `configs/gages/` that is **not** in `train_config.gage_configs`. Currently only `02338660` has data shipped in the image — the others fail at EF5 (no MRMS clip) until you regenerate `data.tar.gz` to include them.
 
