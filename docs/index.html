@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <!-- Primary Meta Tags -->
+  <meta name="title" content="HydroAgent - Li, Yan, Cao, Zhang, Yoo, Hong">
+  <meta name="description" content="HydroAgent closes the gap between frontier LLMs and human experts in hydrologic model calibration: a domain-tuned Qwen3-4B agent trained with SFT and simulator-grounded reinforcement learning (RLSF) on the operational CREST/EF5 model.">
+  <meta name="keywords" content="HydroAgent, hydrologic model calibration, CREST, EF5, LLM agents, reinforcement learning, GRPO, RLSF, streamflow, NSE, Earth-system science, Qwen3, flood forecasting">
+  <meta name="author" content="Zhi Li, Songkun Yan, Jie Cao, Mofan Zhang, Jinwoong Yoo, Yang Hong">
+  <meta name="robots" content="index, follow">
+  <meta name="language" content="English">
+
+  <!-- Open Graph / Facebook -->
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="University of Colorado Boulder &middot; University of Oklahoma">
+  <meta property="og:title" content="HydroAgent: Closing the Gap Between Frontier LLMs and Human Experts in Hydrologic Model Calibration via Simulator-Grounded RL">
+  <meta property="og:description" content="A domain-tuned 4B-parameter agent with simulator-in-the-loop RL substantially closes the gap to frontier LLMs on operational hydrologic model calibration.">
+  <meta property="og:url" content="https://chrimerss.github.io/hydroGPT/">
+  <meta property="og:image" content="https://chrimerss.github.io/hydroGPT/static/images/social_preview.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="HydroAgent benchmark and training overview">
+  <meta property="article:author" content="Zhi Li">
+  <meta property="article:section" content="Research">
+  <meta property="article:tag" content="Hydrologic Calibration">
+  <meta property="article:tag" content="LLM Agents">
+
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="HydroAgent: Closing the Gap Between Frontier LLMs and Human Experts in Hydrologic Model Calibration">
+  <meta name="twitter:description" content="A domain-tuned 4B-parameter agent with simulator-in-the-loop RL substantially closes the gap to frontier LLMs on operational hydrologic model calibration.">
+  <meta name="twitter:image" content="https://chrimerss.github.io/hydroGPT/static/images/social_preview.png">
+  <meta name="twitter:image:alt" content="HydroAgent benchmark and training overview">
+
+  <!-- Academic/Research Specific -->
+  <meta name="citation_title" content="HydroAgent: Closing the Gap Between Frontier LLMs and Human Experts in Hydrologic Model Calibration via Simulator-Grounded RL">
+  <meta name="citation_author" content="Li, Zhi">
+  <meta name="citation_author" content="Yan, Songkun">
+  <meta name="citation_author" content="Cao, Jie">
+  <meta name="citation_author" content="Zhang, Mofan">
+  <meta name="citation_author" content="Yoo, Jinwoong">
+  <meta name="citation_author" content="Hong, Yang">
+  <meta name="citation_publication_date" content="2026">
+  <meta name="citation_pdf_url" content="https://chrimerss.github.io/hydroGPT/static/pdfs/paper.pdf">
+
+  <!-- Additional SEO -->
+  <meta name="theme-color" content="#1d6fb8">
+  <meta name="msapplication-TileColor" content="#1d6fb8">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+
+  <!-- Preconnect for performance -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preconnect" href="https://ajax.googleapis.com">
+  <link rel="preconnect" href="https://cdn.jsdelivr.net">
+
+  <title>HydroAgent &mdash; Simulator-Grounded RL for Hydrologic Model Calibration</title>
+
+  <!-- Favicon and App Icons -->
+  <link rel="icon" type="image/x-icon" href="static/images/favicon.ico">
+  <link rel="apple-touch-icon" href="static/images/favicon.ico">
+
+  <!-- Critical CSS - Load synchronously -->
+  <link rel="stylesheet" href="static/css/bulma.min.css">
+  <link rel="stylesheet" href="static/css/index.css">
+
+  <!-- Non-critical CSS - Load asynchronously -->
+  <link rel="preload" href="static/css/bulma-carousel.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <link rel="preload" href="static/css/bulma-slider.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <link rel="preload" href="static/css/fontawesome.all.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <link rel="preload" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+
+  <noscript>
+    <link rel="stylesheet" href="static/css/bulma-carousel.min.css">
+    <link rel="stylesheet" href="static/css/bulma-slider.min.css">
+    <link rel="stylesheet" href="static/css/fontawesome.all.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+  </noscript>
+
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <script defer src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+  <script defer src="static/js/fontawesome.all.min.js"></script>
+  <script defer src="static/js/bulma-carousel.min.js"></script>
+  <script defer src="static/js/bulma-slider.min.js"></script>
+  <script defer src="static/js/index.js"></script>
+
+  <!-- Structured Data for Academic Papers -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "ScholarlyArticle",
+    "headline": "HydroAgent: Closing the Gap Between Frontier LLMs and Human Experts in Hydrologic Model Calibration via Simulator-Grounded RL",
+    "description": "A domain-tuned 4B-parameter agent with simulator-in-the-loop RL substantially closes the gap to frontier LLMs on operational hydrologic model calibration.",
+    "author": [
+      { "@type": "Person", "name": "Zhi Li", "affiliation": { "@type": "Organization", "name": "University of Colorado Boulder" } },
+      { "@type": "Person", "name": "Songkun Yan", "affiliation": { "@type": "Organization", "name": "University of Oklahoma" } },
+      { "@type": "Person", "name": "Jie Cao", "affiliation": { "@type": "Organization", "name": "University of Oklahoma" } },
+      { "@type": "Person", "name": "Mofan Zhang", "affiliation": { "@type": "Organization", "name": "Stanford University" } },
+      { "@type": "Person", "name": "Jinwoong Yoo", "affiliation": { "@type": "Organization", "name": "NASA Goddard Space Flight Center" } },
+      { "@type": "Person", "name": "Yang Hong", "affiliation": { "@type": "Organization", "name": "University of Oklahoma" } }
+    ],
+    "datePublished": "2026",
+    "url": "https://chrimerss.github.io/hydroGPT/",
+    "image": "https://chrimerss.github.io/hydroGPT/static/images/social_preview.png",
+    "keywords": ["hydrologic model calibration", "CREST", "EF5", "LLM agents", "reinforcement learning", "GRPO", "streamflow", "machine learning"],
+    "isAccessibleForFree": true
+  }
+  </script>
+</head>
+<body>
+
+  <!-- Scroll to Top Button -->
+  <button class="scroll-to-top" onclick="scrollToTop()" title="Scroll to top" aria-label="Scroll to top">
+    <i class="fas fa-chevron-up"></i>
+  </button>
+
+  <main id="main-content">
+  <section class="hero">
+    <div class="hero-body">
+      <div class="container is-max-desktop">
+        <div class="columns is-centered">
+          <div class="column has-text-centered">
+            <h1 class="title is-1 publication-title">HydroAgent: Closing the Gap Between Frontier LLMs and Human Experts in Hydrologic Model Calibration via Simulator-Grounded RL</h1>
+            <div class="is-size-5 publication-authors">
+              <span class="author-block">
+                <a href="mailto:Zhi.Li-2@colorado.edu" target="_blank">Zhi Li</a><sup>1</sup>,</span>
+              <span class="author-block">
+                <a href="mailto:skyan@ou.edu" target="_blank">Songkun Yan</a><sup>2</sup>,</span>
+              <span class="author-block">
+                <a href="mailto:jie.cao@ou.edu" target="_blank">Jie Cao</a><sup>2</sup>,</span>
+              <span class="author-block">
+                <a href="mailto:mofanz@stanford.edu" target="_blank">Mofan Zhang</a><sup>3</sup>,</span>
+              <span class="author-block">
+                <a href="mailto:jinwoong.yoo@nasa.gov" target="_blank">Jinwoong Yoo</a><sup>4</sup>,</span>
+              <span class="author-block">
+                <a href="mailto:yanghong@ou.edu" target="_blank">Yang Hong</a><sup>2</sup></span>
+            </div>
+
+            <div class="is-size-5 publication-authors">
+              <span class="author-block"><sup>1</sup>University of Colorado Boulder&nbsp;&nbsp;</span>
+              <span class="author-block"><sup>2</sup>University of Oklahoma&nbsp;&nbsp;</span>
+              <span class="author-block"><sup>3</sup>Stanford University&nbsp;&nbsp;</span>
+              <span class="author-block"><sup>4</sup>NASA Goddard Space Flight Center</span>
+            </div>
+
+            <div class="column has-text-centered">
+              <div class="publication-links">
+                <!-- Paper PDF -->
+                <span class="link-block">
+                  <a href="static/pdfs/paper.pdf" target="_blank"
+                     class="external-link button is-normal is-rounded is-dark">
+                    <span class="icon"><i class="fas fa-file-pdf"></i></span>
+                    <span>Paper</span>
+                  </a>
+                </span>
+
+                <!-- Code -->
+                <span class="link-block">
+                  <a href="https://github.com/chrimerss/hydroGPT" target="_blank"
+                     class="external-link button is-normal is-rounded is-dark">
+                    <span class="icon"><i class="fab fa-github"></i></span>
+                    <span>Code</span>
+                  </a>
+                </span>
+
+                <!-- Dataset -->
+                <span class="link-block">
+                  <a href="https://huggingface.co/datasets/chrimerss/hydro_cali_agent_example" target="_blank"
+                     class="external-link button is-normal is-rounded is-dark">
+                    <span class="icon">🤗</span>
+                    <span>Data</span>
+                  </a>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Teaser / overview figure -->
+  <section class="hero teaser">
+    <div class="container is-max-desktop">
+      <div class="hero-body">
+        <img src="static/images/overview.png" alt="Overview of the HydroAgent hydrologic calibration benchmark and training pipeline" loading="eager"/>
+        <h2 class="subtitle has-text-centered" style="margin-top:1rem;">
+          <strong>Overview.</strong> We benchmark nine frontier LLM agents on calibrating the operational
+          <strong>CREST/EF5</strong> distributed hydrologic model, then introduce <strong>HydroAgent</strong> &mdash; an
+          open-weight <strong>Qwen3-4B</strong> policy fine-tuned with supervised learning on expert calibration
+          trajectories and <strong>reinforcement learning with simulation feedback (RLSF)</strong>, where the simulator
+          itself is the verifier.
+        </h2>
+      </div>
+    </div>
+  </section>
+
+  <!-- Abstract -->
+  <section class="section hero is-light">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered has-text-centered">
+        <div class="column is-four-fifths">
+          <h2 class="title is-3">Abstract</h2>
+          <div class="content has-text-justified">
+            <p>
+              Calibrating distributed hydrologic models is a critical bottleneck across operational water-resources
+              management &mdash; streamflow prediction, water-supply assessment, reservoir operation, drought monitoring,
+              infrastructure design, and flood forecasting all depend on it: each basin demands a domain expert to
+              translate hydrograph signatures into adjustments of a high-dimensional parameter vector, and the resulting
+              workflow does not transfer between watersheds. We ask a sharper version of a now-common question:
+              <em>can frontier large language model (LLM) agents replace the human hydrologic modeler, and if not, what
+              would it take?</em> We benchmark nine frontier LLM agents &mdash; Claude Opus 4.6/4.7, Sonnet 4.6,
+              GPT-5/5.4/5.4-pro, and Gemini 2.5-pro/3.1-pro/3-flash &mdash; on the calibration of the operational CREST
+              distributed hydrologic model used by the U.S. National Weather Service for flash-flood forecasting. Mean
+              best-of-twenty-rounds Nash&ndash;Sutcliffe Efficiency (NSE) across four held-out gauges spanning
+              329&ndash;40,792&nbsp;km<sup>2</sup> ranges from &minus;0.16 (GPT-5.4) to 0.75 (Sonnet 4.6); the ceiling is
+              reproducible across all three frontier vendors and across capability tiers, and no model reaches the
+              human-expert reference except for Opus-4.7 at one testing gauge. We argue this gap is not a parameter-count
+              problem: it is a domain-grounding problem. We then propose <strong>HydroAgent</strong>, a recipe that
+              fine-tunes the open-weight Qwen3-4B model with supervised fine-tuning on 2,576 expert calibration
+              trajectories and Group-Relative Policy Optimization using NSE as a verifiable reward sourced from online
+              CREST simulations &mdash; reinforcement learning with simulation feedback (RLSF). Our central thesis is
+              that, for Earth-system science, a small domain-tuned policy with simulator-in-the-loop RL is a more
+              compute-efficient and physically faithful path than scaling generic frontier models, and that the
+              multi-modal richness of Earth data makes domain agents an unusually leveraged direction for AI in physical
+              science.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Highlights -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column is-full">
+          <h2 class="title is-3 has-text-centered">Key Contributions</h2>
+          <div class="columns is-multiline" style="margin-top:1rem;">
+            <div class="column is-one-third">
+              <div class="box" style="height:100%;">
+                <p class="title is-5"><i class="fas fa-trophy" style="color:#1d6fb8;"></i>&nbsp; Frontier benchmark</p>
+                <p class="content">
+                  The first systematic benchmark of <strong>nine frontier LLM agents</strong> on calibrating an
+                  operational distributed hydrologic model, with a public release of all 9&nbsp;&times;&nbsp;20
+                  calibration trajectories for reproducibility.
+                </p>
+              </div>
+            </div>
+            <div class="column is-one-third">
+              <div class="box" style="height:100%;">
+                <p class="title is-5"><i class="fas fa-robot" style="color:#1d6fb8;"></i>&nbsp; HydroAgent recipe</p>
+                <p class="content">
+                  A domain-specific recipe that fine-tunes <strong>Qwen3-4B</strong> with SFT&nbsp;+&nbsp;GRPO using NSE
+                  as a verifiable, <strong>simulator-grounded reward</strong> &mdash; reproducible on 4&times;H100.
+                </p>
+              </div>
+            </div>
+            <div class="column is-one-third">
+              <div class="box" style="height:100%;">
+                <p class="title is-5"><i class="fas fa-water" style="color:#1d6fb8;"></i>&nbsp; A position, quantified</p>
+                <p class="content">
+                  For Earth-system tasks with cheap-to-evaluate simulators, a <strong>domain-tuned 4B agent</strong> can
+                  substantially close the gap to frontier generalists &mdash; grounding, not scale, is the bottleneck.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Method -->
+  <section class="section hero is-light">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column is-full has-text-centered">
+          <h2 class="title is-3">Method: SFT&nbsp;+&nbsp;Reinforcement Learning with Simulation Feedback (RLSF)</h2>
+          <img src="static/images/method_schematic.png" alt="HydroAgent calibration loop: set parameters, run simulation, evaluate, parse failure" loading="lazy"/>
+          <div class="content has-text-justified" style="margin-top:1.25rem;">
+            <p>
+              A calibration episode exposes four tools to the agent &mdash; <code>set_parameters</code> (write 13 CREST
+              scalar multipliers), <code>run_simulation</code> (invoke the EF5 binary and parse the simulated-vs-observed
+              hydrograph), <code>evaluate</code> (return NSE plus a multi-criteria diagnostic), and a
+              <code>parse_failure</code> reasoning step. Training proceeds in two phases:
+            </p>
+            <ul>
+              <li>
+                <strong>Phase 1 &mdash; Supervised Fine-Tuning.</strong> Distill 2,576 expert calibration trajectories
+                across 29 U.S. gauges into Qwen3-4B, teaching the tool-call grammar, parameter-bounds convention, and a
+                basic hydrologic-reasoning style.
+              </li>
+              <li>
+                <strong>Phase 2 &mdash; RLSF (GRPO).</strong> Draw K=8 multi-turn rollouts per prompt; each rollout
+                proposes a parameter set, runs an online CREST/EF5 simulation, and is scored by a clipped NSE plus shaped
+                per-turn signals. <em>The simulator is the verifier &mdash; there is no learned reward model.</em> An
+                explicit improvement bonus trains the policy to <em>iterate-until-you-cannot-improve</em>, which is what
+                a hydrologist actually does.
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Frontier results -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column is-full has-text-centered">
+          <h2 class="title is-3">Where Do Frontier Agents Stand?</h2>
+          <div class="content has-text-justified">
+            <p>
+              Each agent calibrates four held-out gauges inside an identical Linux sandbox, with a 20-round budget
+              (up to 200 EF5 simulations per gauge). Best-NSE and rounds-used are tightly coupled: the strongest models
+              use the full horizon, while several pro-tier reasoning models terminate after 1&ndash;2 rounds with budget
+              remaining. Performance bands follow Moriasi et al. (2015); the dashed line at NSE&nbsp;=&nbsp;0.85 is the
+              human-expert reference (an experienced hydrologist using domain knowledge + the DREAM sampler). Use the
+              carousel to browse all four held-out gauges.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div id="results-carousel" class="carousel results-carousel">
+        <div class="item">
+          <img src="static/images/nse_02338660.png" alt="Best NSE per model on gauge 02338660" loading="lazy"/>
+          <h2 class="subtitle has-text-centered">
+            Gauge <code>02338660</code> (329&nbsp;km<sup>2</sup>) &mdash; the canonical evaluation gauge. No frontier
+            model crosses the human-expert reference at NSE&nbsp;=&nbsp;0.85.
+          </h2>
+        </div>
+        <div class="item">
+          <img src="static/images/nse_01403060.png" alt="Best NSE per model on gauge 01403060" loading="lazy"/>
+          <h2 class="subtitle has-text-centered">
+            Gauge <code>01403060</code> &mdash; per-model best-NSE with rounds-used annotated on the right.
+          </h2>
+        </div>
+        <div class="item">
+          <img src="static/images/nse_06279500.png" alt="Best NSE per model on gauge 06279500" loading="lazy"/>
+          <h2 class="subtitle has-text-centered">
+            Gauge <code>06279500</code> (40,792&nbsp;km<sup>2</sup>) &mdash; the largest, hardest basin; the one case
+            where Opus-4.7 reaches the human-expert reference.
+          </h2>
+        </div>
+        <div class="item">
+          <img src="static/images/nse_07144100.png" alt="Best NSE per model on gauge 07144100" loading="lazy"/>
+          <h2 class="subtitle has-text-centered">
+            Gauge <code>07144100</code> &mdash; the qualitative ranking and rounds-used/best-NSE coupling persist across
+            the panel.
+          </h2>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- HydroAgent improvement -->
+  <section class="section hero is-light">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column is-full has-text-centered">
+          <h2 class="title is-3">How Does HydroAgent Improve Streamflow Prediction?</h2>
+          <img src="static/images/improvement_bubble.png" alt="Relative change in four hydrologic-fit metrics for HydroAgent-4B vs the Qwen3-4B baseline" loading="lazy" style="max-width:900px; width:100%;"/>
+          <div class="content has-text-justified" style="margin-top:1.25rem;">
+            <p>
+              Relative change in four hydrologic-fit metrics for <strong>HydroAgent-4B</strong> versus the untuned
+              Qwen3-4B-Instruct baseline, on the four held-out gauges. Blue = improvement, red = degradation; size
+              encodes magnitude. Simulator-grounded post-training improves the metrics calibration is judged by:
+              <strong>NSE improves on all four basins</strong> (from +5% to over +200%), discharge correlation improves on
+              all four, and timing offset (|Lag|) contracts on all four. The lone residual cost is peak-ratio error on
+              gauge <code>02338660</code>, consistent with the volume- and peak-weighted shaping of the RLSF reward.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Ablation table -->
+      <div class="columns is-centered">
+        <div class="column is-three-quarters">
+          <h3 class="title is-5 has-text-centered">Per-gauge ablation of the SFT&nbsp;+&nbsp;RLSF stack</h3>
+          <div class="table-container">
+            <table class="table is-bordered is-striped is-narrow is-hoverable is-fullwidth has-text-centered">
+              <thead>
+                <tr>
+                  <th>Gauge</th><th>Method</th><th>Best NSE</th><th>Sims</th><th>Turns</th><th>Parse&nbsp;fail</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td rowspan="3"><code>07144100</code></td><td>Baseline</td><td>0.34</td><td>15</td><td>50</td><td>0</td></tr>
+                <tr><td>SFT-only</td><td>0.07</td><td>1</td><td>15</td><td>4</td></tr>
+                <tr><td><strong>HydroAgent</strong></td><td><strong>0.65</strong></td><td>13</td><td>50</td><td>0</td></tr>
+                <tr><td rowspan="3"><code>06279500</code></td><td>Baseline</td><td>&minus;1.41</td><td>13</td><td>50</td><td>1</td></tr>
+                <tr><td>SFT-only</td><td>&minus;2.27</td><td>1</td><td>13</td><td>4</td></tr>
+                <tr><td><strong>HydroAgent</strong></td><td><strong>&minus;0.84</strong></td><td>17</td><td>50</td><td>0</td></tr>
+                <tr><td rowspan="3"><code>02338660</code></td><td>Baseline</td><td>0.65</td><td>13</td><td>50</td><td>0</td></tr>
+                <tr><td>SFT-only</td><td>&minus;17.53</td><td>1</td><td>11</td><td>4</td></tr>
+                <tr><td><strong>HydroAgent</strong></td><td><strong>0.68</strong></td><td>12</td><td>50</td><td>0</td></tr>
+                <tr><td rowspan="3"><code>01403060</code></td><td>Baseline</td><td>&minus;0.15</td><td>16</td><td>50</td><td>0</td></tr>
+                <tr><td>SFT-only</td><td>0.58</td><td>4</td><td>16</td><td>4</td></tr>
+                <tr><td><strong>HydroAgent</strong></td><td><strong>0.40</strong></td><td>14</td><td>50</td><td>0</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="has-text-centered is-size-7">Higher NSE is better. SFT alone is unstable; the full SFT&nbsp;+&nbsp;RLSF stack restores long-horizon iteration and zero parse failures.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Hydrographs -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column is-full has-text-centered">
+          <h2 class="title is-3">Calibrated Hydrographs</h2>
+          <img src="static/images/hydrograph_combined.png" alt="Observed vs simulated hydrographs for HydroAgent and the Qwen3-4B baseline across four held-out gauges" loading="lazy"/>
+          <div class="content has-text-justified" style="margin-top:1.25rem;">
+            <p>
+              Observed (black) versus simulated discharge for <strong>HydroAgent-4B</strong> (orange) and the Qwen3-4B
+              baseline (gray) across the four held-out gauges, with precipitation forcing shown on the inverted top axis.
+              Simulator-grounded RL aligns event peaks and timing while stabilizing volume across distinct hydroclimatic
+              regions.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Dataset -->
+  <section class="section hero is-light">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column is-full has-text-centered">
+          <h2 class="title is-3">Benchmark Basins</h2>
+          <img src="static/images/gauge_map.png" alt="Map of 10 training and 4 testing CONUS gauges, sized by basin area" loading="lazy" style="max-width:820px; width:100%;"/>
+          <div class="content has-text-justified" style="margin-top:1.25rem;">
+            <p>
+              Ten CONUS training gauges (539&ndash;2,401&nbsp;km<sup>2</sup>) and four geographically held-out testing
+              gauges (329&ndash;40,792&nbsp;km<sup>2</sup>), spanning distinct hydroclimatic regions, hourly forcings
+              (MRMS gauge-corrected precipitation, daily PET), and 13 calibrated CREST parameters.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- BibTeX -->
+  <section class="section" id="BibTeX">
+    <div class="container is-max-desktop content">
+      <div class="bibtex-header">
+        <h2 class="title">BibTeX</h2>
+        <button class="copy-bibtex-btn" onclick="copyBibTeX()" title="Copy BibTeX to clipboard">
+          <i class="fas fa-copy"></i>
+          <span class="copy-text">Copy</span>
+        </button>
+      </div>
+      <pre id="bibtex-code"><code>@article{li2026hydroagent,
+  title   = {HydroAgent: Closing the Gap Between Frontier LLMs and Human Experts
+             in Hydrologic Model Calibration via Simulator-Grounded RL},
+  author  = {Li, Zhi and Yan, Songkun and Cao, Jie and Zhang, Mofan
+             and Yoo, Jinwoong and Hong, Yang},
+  year    = {2026},
+  url     = {https://chrimerss.github.io/hydroGPT/}
+}</code></pre>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div class="container">
+      <div class="columns is-centered">
+        <div class="column is-8">
+          <div class="content">
+            <p>
+              This page was built using the
+              <a href="https://github.com/eliahuhorwitz/Academic-project-page-template" target="_blank">Academic Project Page Template</a>
+              which was adopted from the <a href="https://nerfies.github.io" target="_blank">Nerfies</a> project page.
+              You are free to borrow the source code of this website, we just ask that you link back to this page in the
+              footer. <br> This website is licensed under a
+              <a rel="license" href="http://creativecommons.org/licenses/by-sa/4.0/" target="_blank">Creative
+              Commons Attribution-ShareAlike 4.0 International License</a>.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </footer>
+  </main>
+
+</body>
+</html>
