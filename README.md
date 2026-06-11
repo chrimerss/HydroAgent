@@ -432,6 +432,16 @@ If you use HydroLLM in your research, please cite:
   year={2026},
   url={https://github.com/chrimerss/HydroLLM}
 }
+
+@misc{li2026hydroagentclosinggapfrontier,
+      title={HydroAgent: Closing the Gap Between Frontier LLMs and Human Experts in Hydrologic Model Calibration via Simulator-Grounded RL}, 
+      author={Zhi Li and Songkun Yan and Jie Cao and Mofan Zhang and Anjiang Wei and Jinwoong Yoo and Yang Hong},
+      year={2026},
+      eprint={2605.17792},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2605.17792}, 
+}
 ```
 
 ## Acknowledgement
