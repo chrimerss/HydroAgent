@@ -310,8 +310,57 @@
     </div>
   </section>
 
-  <!-- Frontier results -->
+  <!-- Training recipe / reproducibility -->
   <section class="section">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column is-full">
+          <h2 class="title is-3 has-text-centered">Training Recipe &amp; Reproducibility</h2>
+          <div class="content has-text-justified" style="margin-top:0.5rem;">
+            <p>
+              The RL stack is <strong>verl&nbsp;0.5 GRPO</strong> with <strong>SGLang</strong> multi-turn rollouts and an
+              in-process EF5 tool, trained in full <strong>BF16 under FSDP (no LoRA)</strong> on
+              <strong>4&times;H100 (80&nbsp;GB)</strong>. For each prompt the engine draws K rollouts; each rollout is a
+              multi-turn calibration episode that dispatches <code>set_parameters</code>&nbsp;&rarr;
+              <code>run_simulation</code>&nbsp;&rarr; <code>evaluate</code> to registered tool classes, with EF5
+              invocations gated by a 32-way semaphore to avoid CPU/IO contention. A checkpoint cadence lands roughly
+              every 5&nbsp;hours; <code>resume_mode: auto</code> recovers across Modal's 24&nbsp;h function-timeout cycle.
+            </p>
+          </div>
+          <div class="columns is-centered">
+            <div class="column is-three-quarters">
+              <div class="table-container">
+                <table class="table is-bordered is-striped is-narrow is-hoverable is-fullwidth">
+                  <thead>
+                    <tr><th>Setting</th><th>Value</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr><td>Base model</td><td><code>Qwen/Qwen3-4B-Instruct-2507</code> (full FT, BF16, FSDP)</td></tr>
+                    <tr><td>Advantage estimator</td><td>GRPO (group-relative, critic-free)</td></tr>
+                    <tr><td>Rollouts per prompt (K)</td><td>6&ndash;8 &middot; batch = 4 prompts/step</td></tr>
+                    <tr><td>Max calibration turns / rollout</td><td>50</td></tr>
+                    <tr><td>Actor learning rate</td><td>1&times;10<sup>&minus;6</sup> (5e&minus;6 caused collapse)</td></tr>
+                    <tr><td>KL anchor coeff.</td><td>0.2 (strong anchor to SFT init)</td></tr>
+                    <tr><td>Entropy coeff.</td><td>0.01</td></tr>
+                    <tr><td>Sampling</td><td>temperature 1.0, top-p 0.95</td></tr>
+                    <tr><td>Epochs</td><td>30 over the 10-gauge training set</td></tr>
+                    <tr><td>Infrastructure</td><td>verl 0.5 + SGLang on 4&times;H100, EF5 concurrency 32</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <p class="has-text-centered is-size-7">
+                Full configs and the eval harness are in the
+                <a href="https://github.com/chrimerss/HydroAgent" target="_blank">code repository</a>.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Frontier results -->
+  <section class="section hero is-light">
     <div class="container is-max-desktop">
       <div class="columns is-centered">
         <div class="column is-full has-text-centered">
@@ -362,7 +411,7 @@
   </section>
 
   <!-- HydroAgent improvement -->
-  <section class="section hero is-light">
+  <section class="section">
     <div class="container is-max-desktop">
       <div class="columns is-centered">
         <div class="column is-full has-text-centered">
@@ -415,7 +464,7 @@
   </section>
 
   <!-- Hydrographs -->
-  <section class="section">
+  <section class="section hero is-light">
     <div class="container is-max-desktop">
       <div class="columns is-centered">
         <div class="column is-full has-text-centered">
@@ -435,7 +484,7 @@
   </section>
 
   <!-- Dataset -->
-  <section class="section hero is-light">
+  <section class="section">
     <div class="container is-max-desktop">
       <div class="columns is-centered">
         <div class="column is-full has-text-centered">
@@ -445,7 +494,68 @@
             <p>
               Ten CONUS training gauges (539&ndash;2,401&nbsp;km<sup>2</sup>) and four geographically held-out testing
               gauges (329&ndash;40,792&nbsp;km<sup>2</sup>), spanning distinct hydroclimatic regions, hourly forcings
-              (MRMS gauge-corrected precipitation, daily PET), and 13 calibrated CREST parameters.
+              (MRMS gauge-corrected precipitation, daily PET), and 13 calibrated CREST parameters. Each window is a
+              clear flood event (rising + receding limbs) selected by a flood-window audit over the observation series.
+            </p>
+          </div>
+
+          <div class="columns" style="margin-top:0.5rem;">
+            <div class="column is-7">
+              <h3 class="title is-5 has-text-centered">Training set (10 gauges)</h3>
+              <div class="table-container">
+                <table class="table is-bordered is-striped is-narrow is-hoverable is-fullwidth is-size-7">
+                  <thead>
+                    <tr><th>Gauge ID</th><th class="has-text-right">Basin (km²)</th><th class="has-text-right">Lat</th><th class="has-text-right">Lon</th><th>Window (UTC)</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr><td><code>11383500</code></td><td class="has-text-right">539</td><td class="has-text-right">40.014</td><td class="has-text-right">−121.948</td><td>2018-05-19 → 07-17</td></tr>
+                    <tr><td><code>11043000</code></td><td class="has-text-right">575</td><td class="has-text-right">33.480</td><td class="has-text-right">−117.144</td><td>2019-03-15 → 05-13</td></tr>
+                    <tr><td><code>11152000</code></td><td class="has-text-right">632</td><td class="has-text-right">36.281</td><td class="has-text-right">−121.323</td><td>2018-05-29 → 07-27</td></tr>
+                    <tr><td><code>02294781</code></td><td class="has-text-right">1,064</td><td class="has-text-right">27.825</td><td class="has-text-right">−81.802</td><td>2018-04-29 → 06-27</td></tr>
+                    <tr><td><code>02312000</code></td><td class="has-text-right">1,476</td><td class="has-text-right">28.480</td><td class="has-text-right">−82.178</td><td>2018-11-15 → 01-13</td></tr>
+                    <tr><td><code>07195430</code></td><td class="has-text-right">1,489</td><td class="has-text-right">36.109</td><td class="has-text-right">−94.533</td><td>2018-01-04 → 03-04</td></tr>
+                    <tr><td><code>11179000</code></td><td class="has-text-right">1,639</td><td class="has-text-right">37.587</td><td class="has-text-right">−121.961</td><td>2018-06-03 → 08-01</td></tr>
+                    <tr><td><code>14301000</code></td><td class="has-text-right">1,727</td><td class="has-text-right">45.704</td><td class="has-text-right">−123.755</td><td>2018-09-11 → 11-09</td></tr>
+                    <tr><td><code>14207500</code></td><td class="has-text-right">1,828</td><td class="has-text-right">45.351</td><td class="has-text-right">−122.676</td><td>2018-04-09 → 06-07</td></tr>
+                    <tr><td><code>11376000</code></td><td class="has-text-right">2,401</td><td class="has-text-right">40.387</td><td class="has-text-right">−122.239</td><td>2018-09-21 → 11-19</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="column is-5">
+              <h3 class="title is-5 has-text-centered">Testing set (4 held-out gauges)</h3>
+              <div class="table-container">
+                <table class="table is-bordered is-striped is-narrow is-hoverable is-fullwidth is-size-7">
+                  <thead>
+                    <tr><th>Gauge ID</th><th class="has-text-right">Basin (km²)</th><th class="has-text-right">Lat</th><th class="has-text-right">Lon</th><th>Window (UTC)</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr><td><code>02338660</code></td><td class="has-text-right">329</td><td class="has-text-right">33.236</td><td class="has-text-right">−84.988</td><td>2018-07-01 → 08-31</td></tr>
+                    <tr><td><code>01403060</code></td><td class="has-text-right">2,033</td><td class="has-text-right">40.551</td><td class="has-text-right">−74.548</td><td>2018-11-11 → 01-09</td></tr>
+                    <tr><td><code>06279500</code></td><td class="has-text-right">40,792</td><td class="has-text-right">44.759</td><td class="has-text-right">−108.182</td><td>2018-06-13 → 08-11</td></tr>
+                    <tr><td><code>07144100</code></td><td class="has-text-right">3,209</td><td class="has-text-right">37.883</td><td class="has-text-right">−97.425</td><td>2019-03-30 → 05-28</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Acknowledgement -->
+  <section class="section hero is-light">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered has-text-centered">
+        <div class="column is-four-fifths">
+          <h2 class="title is-3">Acknowledgement</h2>
+          <div class="content has-text-justified">
+            <p>
+              We appreciate <strong>Modal</strong> for sponsoring the computing credits for this research. The code is
+              released under the MIT license; see the
+              <a href="https://github.com/chrimerss/HydroAgent" target="_blank">project repository</a> for training,
+              evaluation, and data-preparation scripts.
             </p>
           </div>
         </div>
