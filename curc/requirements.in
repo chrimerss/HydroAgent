@@ -1,0 +1,16 @@
+# Inference stack for curc/eval.py. sglang 0.4.8 matches the
+# verlai/verl:app-verl0.5-sglang0.4.8 image used on Modal; compile with
+#   uv pip compile curc/requirements.in --exclude-newer 2025-06-25T00:00:00Z \
+#       --python-version 3.11 -o curc/requirements.lock
+# so its unpinned deps resolve as they did when 0.4.8 shipped (newer
+# compressed-tensors needs transformers>=4.53, but sglang pins 4.52.3).
+sglang[all]==0.4.8
+torch==2.7.1
+flashinfer-python==0.2.6.post1
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+pyyaml
+huggingface_hub
+hf_transfer
+pytest

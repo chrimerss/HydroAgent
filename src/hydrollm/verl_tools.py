@@ -19,7 +19,7 @@ import logging
 import uuid
 from typing import Any
 
-from hydrollm.config import GageConfig, load_gage_config
+from hydrollm.config import DATA_ROOT, GageConfig, load_gage_config
 from hydrollm.environment import HydroEnvironment
 
 logger = logging.getLogger(__name__)
@@ -248,7 +248,7 @@ def _dump_sandbox_diagnostics(env: HydroEnvironment) -> None:
                 up = line.strip().upper()
                 if any(up.startswith(k) for k in ("OBS=", "LOC=", "TIME_", "OUTPUT=", "[GAUGE")):
                     logger.warning("[HYDRO_DIAG]   %s", line.strip())
-        mrms = Path(f"/app/data/data_mrms_clip/{gage_id}")
+        mrms = Path(f"{DATA_ROOT}/data_mrms_clip/{gage_id}")
         if mrms.exists():
             files = sorted(p.name for p in mrms.iterdir())
             logger.warning(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -135,7 +137,36 @@ def load_gage_config(path: str | Path) -> GageConfig:
     """Load a gage configuration from YAML."""
     with open(path) as f:
         data = yaml.safe_load(f)
+    for key in ("obs_dir", "control_template"):
+        if key in data:
+            data[key] = resolve_data_path(data[key])
     return GageConfig(**data)
+
+
+# ---------------------------------------------------------------------------
+# Data root
+# ---------------------------------------------------------------------------
+
+# Gage YAMLs, the control template, and the EF5 control writer all use the
+# container path /app/data. Outside a container (e.g. on an HPC cluster) set
+# HYDROLLM_DATA_ROOT to the directory holding the extracted data.tar.gz and
+# every /app/data path is rewritten to it. Unset, behaviour is unchanged.
+CONTAINER_DATA_ROOT = "/app/data"
+DATA_ROOT = os.environ.get("HYDROLLM_DATA_ROOT", CONTAINER_DATA_ROOT).rstrip("/")
+
+
+def resolve_data_path(path: str) -> str:
+    """Map a /app/data/... path onto DATA_ROOT."""
+    if path == CONTAINER_DATA_ROOT or path.startswith(CONTAINER_DATA_ROOT + "/"):
+        return DATA_ROOT + path[len(CONTAINER_DATA_ROOT):]
+    return path
+
+
+def remap_data_paths(text: str) -> str:
+    """Rewrite every /app/data/ occurrence in a control-file body."""
+    if DATA_ROOT == CONTAINER_DATA_ROOT:
+        return text
+    return text.replace(CONTAINER_DATA_ROOT + "/", DATA_ROOT + "/")
 
 
 def load_model_config(path: str | Path) -> ModelConfig:

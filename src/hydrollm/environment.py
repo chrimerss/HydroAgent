@@ -21,9 +21,11 @@ from typing import Optional
 import numpy as np
 
 from hydrollm.config import (
+    DATA_ROOT,
     DEFAULT_PARAMETERS,
     GageConfig,
     PARAMETER_RANGES,
+    remap_data_paths,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,7 +151,7 @@ class HydroEnvironment:
                     up = line.strip().upper()
                     if any(up.startswith(k) for k in ("OBS=", "LOC=", "TIME_", "OUTPUT=", "[GAUGE")):
                         logger.warning("[EF5_DIAG]   %s", line.strip())
-            mrms_loc = Path(f"/app/data/data_mrms_clip/{self.gage.gage_id}")
+            mrms_loc = Path(f"{DATA_ROOT}/data_mrms_clip/{self.gage.gage_id}")
             if mrms_loc.exists():
                 files = sorted(p.name for p in mrms_loc.iterdir())
                 logger.warning("[EF5_DIAG] mrms_loc=%s n_files=%d first=%s last=%s",
@@ -307,6 +309,7 @@ class HydroEnvironment:
             content = self._inject_parameters(content)
 
         # Fix paths for sandbox
+        content = remap_data_paths(content)
         content = self._fix_output_path(content)
         content = self._fix_obs_filename(content)
 
@@ -321,7 +324,7 @@ class HydroEnvironment:
     def _substitute_gage_metadata(self, content: str) -> str:
         """Substitute per-gage placeholders into the shared control template."""
         g = self.gage
-        mrms_loc = f"/app/data/data_mrms_clip/{g.gage_id}/"
+        mrms_loc = f"{DATA_ROOT}/data_mrms_clip/{g.gage_id}/"
         replacements = {
             "GAUGE_ID": str(g.gage_id),
             "GAUGE_LON": str(g.lon),
