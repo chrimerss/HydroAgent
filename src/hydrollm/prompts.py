@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from hydrollm.config import GageConfig, PARAMETER_RANGES, TUNABLE_PARAMETERS
 
+# NSE above which the agent may stop (stated in SYSTEM_PROMPT; the v2 session
+# harness also ends a session when the agent stops after passing it).
+STOP_NSE = 0.8
 
 SYSTEM_PROMPT = """\
 You are an expert hydrologic model calibration scientist. You calibrate \
@@ -33,16 +36,21 @@ alpha, beta, alpha0, iwu) as numeric values.
 Protocol: each iteration is set_parameters → run_simulation → evaluate. \
 After each evaluate result, write 1–2 sentences of diagnosis, then begin \
 the next iteration with another set_parameters tool_call. Adjust one \
-process at a time (peak, volume, timing). Stop when NSE > target.\
+process at a time (peak, volume, timing). Stop when NSE > 0.8.\
 """
+assert f"Stop when NSE > {STOP_NSE}." in SYSTEM_PROMPT
+
+# The original wording (harness v1), kept for like-for-like comparisons: it
+# names a target that the prompts never give.
+SYSTEM_PROMPT_V1 = SYSTEM_PROMPT.replace(f"Stop when NSE > {STOP_NSE}.", "Stop when NSE > target.")
 
 
 def build_user_prompt(gage_config: GageConfig) -> str:
     """Build the user prompt for a specific gage.
 
-    Includes watershed metadata and parameter ranges. The objective
-    intentionally does NOT include a target NSE — the agent should aim
-    to maximize NSE for as long as it can find further improvements.
+    Includes watershed metadata and parameter ranges. The objective asks
+    the agent to keep improving NSE; the stopping threshold (NSE > 0.8)
+    lives in SYSTEM_PROMPT.
     """
     # Build parameter table
     param_lines = []
@@ -76,15 +84,33 @@ Begin by calling set_parameters.\
 """
 
 
-def build_messages(gage_config: GageConfig) -> list[dict[str, str]]:
+def build_messages(gage_config: GageConfig, harness: str = "v2") -> list[dict[str, str]]:
     """Build the initial message list for a calibration session.
 
     Returns a list of message dicts suitable for chat template formatting.
+    `harness="v1"` uses the original system prompt (see hydrollm.session).
     """
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": SYSTEM_PROMPT_V1 if harness == "v1" else SYSTEM_PROMPT},
         {"role": "user", "content": build_user_prompt(gage_config)},
     ]
+
+
+def fit_context(messages: list[dict], render, count_tokens, max_tokens: int) -> str:
+    """Trim `messages` in place until the rendered prompt fits; return the prompt.
+
+    Always keeps the system prompt and the user's task message (the first
+    two messages). Removes whole exchanges from the front of the rest: an
+    assistant message together with the tool results or retry hint that
+    follow it, so no tool result is left without the call that produced it.
+    """
+    prompt = render(messages)
+    while count_tokens(prompt) > max_tokens and len(messages) > 3:
+        del messages[2]
+        while len(messages) > 3 and messages[2]["role"] != "assistant":
+            del messages[2]
+        prompt = render(messages)
+    return prompt
 
 
 def _format_time(time_str: str) -> str:

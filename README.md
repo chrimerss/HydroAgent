@@ -239,7 +239,14 @@ modal run modal_app/eval.py --checkpoint-path /checkpoints/qwen3-4b-grpo-anchore
 modal run modal_app/eval.py --gage-config configs/gages/02338660.yaml
 ```
 
-Eval defaults to **greedy decoding** (`temperature=0.0`) for reproducibility. On `<tool_call>` parse failure the loop retries up to 3 times with a "re-emit valid JSON" hint before giving up.
+Eval defaults to **greedy decoding** (`temperature=0.0`) for reproducibility. The session loop lives in `src/hydrollm/session.py` and is shared by `modal_app/eval.py`, `curc/eval.py` and `wsp/`. Its default harness (`v2`):
+
+- tells the agent to stop when NSE > 0.8, and ends the session if it stops after passing that;
+- keeps the user's task message when the 8k context overflows, dropping the oldest whole exchanges instead;
+- answers a turn without a tool call with a hint naming the next protocol step (up to 3 in a row, then the session ends);
+- tells the agent when a requested parameter value was clamped to its range.
+
+`--harness v1` reproduces the original loop exactly (stop "when NSE > target" with no target given, task message dropped first on overflow, "re-emit your tool call exactly" hint). On the held-out gages with sampled decoding (5 seeds), v2 cut turns without a tool call from about 20 to 4 per session and raised the mean clipped best NSE from 0.142 to 0.225 (`curc/compare_harness.py`).
 
 Results are saved to the `hydrollm-results` Modal Volume in a per-step directory layout:
 
@@ -263,6 +270,24 @@ modal volume ls hydrollm-results experiment/global_step_50
 modal volume get hydrollm-results experiment/global_step_50/02338660.json ./
 modal volume get hydrollm-results experiment/global_step_50/_summary.json ./
 ```
+
+## Running on CU Research Computing (Alpine)
+
+`curc/` runs the same SGLang eval protocol as `modal_app/eval.py` under Slurm, without Modal or containers. Set `HYDROLLM_DATA_ROOT` and every `/app/data` path in the gage configs and control template is rewritten to it (`curc/env.sh` sets this for you).
+
+```bash
+cd /projects/$USER/HydroAgent
+sbatch curc/setup.sbatch   # acompile: conda env, EF5 build, data.tar.gz, HF weights, EF5 smoke test
+sbatch curc/eval.sbatch    # ah200: one H200, base Qwen3-4B on the held-out test gages
+```
+
+Alpine has no H100 partition; `ah200` (H200, also Hopper/sm_90) is the closest match. Its 8 full GPUs are usually backlogged, while a half-GPU MIG slice (71 GB) is plenty for a 4B model and typically starts within minutes:
+
+```bash
+sbatch --gres=gpu:h200_3g.71gb:1 curc/eval.sbatch
+```
+
+Override `MODEL`, `GAGES`, `MAX_TURNS`, or `RUN_KIND` via `sbatch --export=ALL`. Results land in `results/<run_kind>/<model>/`, logs in `curc/logs/`. Python deps are pinned in `curc/requirements.lock`, resolved as of sglang 0.4.8's release so its unpinned dependencies stay compatible with `transformers==4.52.3`.
 
 ## Local Development
 

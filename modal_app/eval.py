@@ -41,34 +41,6 @@ results_vol = modal.Volume.from_name("hydrollm-results", create_if_missing=True)
 checkpoints_vol = modal.Volume.from_name("hydrollm-checkpoints", create_if_missing=True)
 
 
-_EVALUATE_METRIC_KEYS = (
-    "NSE", "CC", "KGE",
-    "sim_peak", "obs_peak", "peak_ratio",
-    "lag_hours_sim_minus_obs", "num_points",
-)
-
-
-def _compact_tool_result(tool_name: str, data: dict) -> str:
-    status = data.get("status", "error")
-    if status == "error":
-        return json.dumps({"status": "error", "message": data.get("message", "")})
-    if tool_name == "set_parameters":
-        return json.dumps({"status": "ok", "params": data.get("validated_params", {})})
-    if tool_name == "run_simulation":
-        return json.dumps({
-            "status": "ok",
-            "run": data.get("run_number"),
-            "message": "Simulation complete. Call evaluate to see metrics.",
-        })
-    if tool_name == "evaluate":
-        payload = {"status": "ok"}
-        for key in _EVALUATE_METRIC_KEYS:
-            if key in data:
-                payload[key] = data[key]
-        return json.dumps(payload)
-    return json.dumps({"status": status})
-
-
 def _resolve_checkpoint(checkpoint_path: str) -> str:
     """If a directory was given without a global_step_N suffix, pick the latest."""
     p = Path(checkpoint_path)
@@ -135,8 +107,12 @@ def run_inference(
     temperature: float = 0.0,
     max_tokens: int = 2048,
     parse_retry_limit: int = 3,
+    harness: str = "v2",
 ):
     """Evaluate a verl checkpoint OR HF model on the held-out gage set.
+
+    The session loop is hydrollm.session.run_session (shared with
+    curc/eval.py); `harness` selects "v2" (fixed, default) or "v1" (original).
 
     Pass exactly one of:
         - `checkpoint_path`: a verl GRPO checkpoint dir (FSDP shards are
@@ -150,10 +126,7 @@ def run_inference(
     """
     import logging
     import os
-    import re
     import subprocess
-    import time
-    import uuid
 
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("hydrollm.eval")
@@ -162,9 +135,7 @@ def run_inference(
     sys.path.insert(0, "/workspace/src")
 
     from hydrollm.config import load_gage_config
-    from hydrollm.environment import HydroEnvironment
-    from hydrollm.prompts import build_messages
-    from hydrollm.tools import HYDRO_TOOLS, ToolExecutor, parse_tool_calls
+    from hydrollm.session import run_session
 
     if checkpoint_path and model_id:
         raise ValueError("Pass either --checkpoint-path OR --model-id, not both.")
@@ -241,15 +212,9 @@ def run_inference(
         "max_new_tokens": max_tokens,
         "stop": ["<|im_end|>"],
     }
-    max_prompt_tokens = 8192 - max_tokens
 
-    _RETRY_HINT = (
-        "Your previous response could not be parsed as a valid tool call. "
-        "Re-emit your tool call exactly in this format and nothing else:\n"
-        "<tool_call>\n"
-        '{"name": "<tool_name>", "arguments": {<json_arguments>}}\n'
-        "</tool_call>"
-    )
+    def generate(prompt: str) -> str:
+        return engine.generate([prompt], sampling_params)[0]["text"]
 
     summary: list[dict] = []
 
@@ -267,133 +232,19 @@ def run_inference(
             logger.info("Run kind=%s  Run tag=%s  Max turns=%d", run_kind, run_tag, max_turns)
             logger.info("=" * 60)
 
-            env = HydroEnvironment(gcfg)
-            executor = ToolExecutor(env)
-            messages = build_messages(gcfg)
-
-            parameter_trajectory: list[dict] = []
-            valid_tool_calls = 0
-            invalid_tool_calls = 0
-            turn_details: list[dict] = []
-            parse_failures = 0
-            start = time.time()
-
-            try:
-                for turn in range(max_turns):
-                    logger.info("[%s] Turn %d/%d", gcfg.gage_id, turn + 1, max_turns)
-                    prompt = tokenizer.apply_chat_template(
-                        messages, tools=HYDRO_TOOLS, tokenize=False, add_generation_prompt=True,
-                    )
-                    plen = len(tokenizer.encode(prompt, add_special_tokens=False))
-                    while plen > max_prompt_tokens and len(messages) > 2:
-                        messages.pop(1)
-                        prompt = tokenizer.apply_chat_template(
-                            messages, tools=HYDRO_TOOLS, tokenize=False, add_generation_prompt=True,
-                        )
-                        plen = len(tokenizer.encode(prompt, add_special_tokens=False))
-
-                    outputs = engine.generate([prompt], sampling_params)
-                    assistant_message = outputs[0]["text"]
-                    tool_calls = parse_tool_calls(assistant_message)
-
-                    if not tool_calls:
-                        messages.append({"role": "assistant", "content": assistant_message})
-                        turn_details.append({
-                            "turn": turn + 1,
-                            "action": "parse_failure",
-                            "response_preview": assistant_message[:500],
-                        })
-                        parse_failures += 1
-                        if parse_failures > parse_retry_limit:
-                            logger.info(
-                                "[%s] Parse failed %d times (>%d), ending.",
-                                gcfg.gage_id, parse_failures, parse_retry_limit,
-                            )
-                            break
-                        logger.info(
-                            "[%s] Parse failed (%d/%d) — appending retry hint.",
-                            gcfg.gage_id, parse_failures, parse_retry_limit,
-                        )
-                        messages.append({"role": "user", "content": _RETRY_HINT})
-                        continue
-                    parse_failures = 0
-
-                    reasoning = re.sub(r"<tool_call>.*?</tool_call>", "", assistant_message, flags=re.DOTALL).strip()
-                    json_pattern = r'\{"name"\s*:\s*"\w+"\s*,\s*"arguments"\s*:\s*\{.*?\}\}'
-                    reasoning = re.sub(json_pattern, "", reasoning, flags=re.DOTALL).strip()
-
-                    openai_tool_calls = []
-                    for call in tool_calls:
-                        cid = f"call_{uuid.uuid4().hex[:8]}"
-                        call["id"] = cid
-                        args_dict = call["arguments"] if isinstance(call["arguments"], dict) else json.loads(call["arguments"])
-                        openai_tool_calls.append({
-                            "id": cid,
-                            "type": "function",
-                            "function": {"name": call["name"], "arguments": args_dict},
-                        })
-
-                    messages.append({
-                        "role": "assistant",
-                        "content": reasoning,
-                        "tool_calls": openai_tool_calls,
-                    })
-
-                    for call in tool_calls:
-                        tool_name = call["name"]
-                        tool_args = call["arguments"]
-                        logger.info("[%s] Executing %s ...", gcfg.gage_id, tool_name)
-                        result_str = executor.execute(tool_name, tool_args)
-                        result_data = json.loads(result_str)
-
-                        if result_data.get("status") == "error":
-                            invalid_tool_calls += 1
-                        else:
-                            valid_tool_calls += 1
-                        if tool_name == "set_parameters" and result_data.get("status") == "ok":
-                            parameter_trajectory.append(result_data.get("validated_params", {}))
-
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "name": tool_name,
-                            "content": _compact_tool_result(tool_name, result_data),
-                        })
-
-                        entry = {"turn": turn + 1, "tool": tool_name}
-                        if tool_name == "evaluate" and result_data.get("status") == "ok":
-                            for k in _EVALUATE_METRIC_KEYS:
-                                if k in result_data:
-                                    entry[k] = result_data[k]
-                        turn_details.append(entry)
-            finally:
-                elapsed = time.time() - start
-                env.cleanup()
-
-            nse_hist = env.nse_history
-            best_nse = max(nse_hist) if nse_hist else None
-
+            record = run_session(
+                generate, tokenizer, gcfg, harness=harness, max_turns=max_turns,
+                max_tokens=max_tokens, context_len=8192, parse_retry_limit=parse_retry_limit,
+            )
+            elapsed = record["elapsed_seconds"]
             result = {
                 "run_kind": run_kind,
                 "run_tag": run_tag,
                 "model_id": model_id,
                 "checkpoint_path": checkpoint_path,
                 "sglang_model_path": sglang_model_path,
-                "gage_id": gcfg.gage_id,
                 "temperature": temperature,
-                "final_nse": nse_hist[-1] if nse_hist else None,
-                "best_nse": round(best_nse, 4) if best_nse is not None else None,
-                "nse_history": [round(n, 4) for n in nse_hist],
-                "num_turns": len(turn_details),
-                "num_simulation_runs": env.run_count,
-                "valid_tool_calls": valid_tool_calls,
-                "invalid_tool_calls": invalid_tool_calls,
-                "parse_failures_total": parse_failures,
-                "parameter_trajectory": parameter_trajectory,
-                "target_nse": gcfg.target_nse,
-                "target_met": best_nse is not None and best_nse > gcfg.target_nse,
-                "elapsed_seconds": round(elapsed, 1),
-                "turn_details": turn_details,
+                **record,
             }
 
             out_path = out_dir / f"{gcfg.gage_id}.json"
@@ -486,6 +337,7 @@ def main(
     max_tokens: int = 2048,
     parse_retry_limit: int = 3,
     download_dir: str = "results",
+    harness: str = "v2",
 ):
     """Run an SGLang eval on the held-out gage set.
 
@@ -519,6 +371,7 @@ def main(
         temperature=temperature,
         max_tokens=max_tokens,
         parse_retry_limit=parse_retry_limit,
+        harness=harness,
     )
     print(json.dumps(summary, indent=2, default=str))
 
