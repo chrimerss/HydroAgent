@@ -1,0 +1,6 @@
+#!/bin/bash
+# Entry point for WSP trial commands (see wsp/client.py).
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$HERE/curc/env.sh"
+export PYTHONNOUSERSITE=1
+exec "$HYDRO_ENV/bin/python" "$HERE/wsp/client.py" "$@"

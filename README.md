@@ -289,6 +289,10 @@ sbatch --gres=gpu:h200_3g.71gb:1 curc/eval.sbatch
 
 Override `MODEL`, `GAGES`, `MAX_TURNS`, or `RUN_KIND` via `sbatch --export=ALL`. Results land in `results/<run_kind>/<model>/`, logs in `curc/logs/`. Python deps are pinned in `curc/requirements.lock`, resolved as of sglang 0.4.8's release so its unpinned dependencies stay compatible with `transformers==4.52.3`.
 
+## Weight-Space Programming Experiment
+
+`wsp/` replicates MIT CSAIL's "Sparks of Weight-Space Programming" (an LLM edits a few weights of another model directly, without training) on the calibration agent, with five independent editing trials and matched random-edit controls. The edits repaired the agent's stop-and-loop failure but did not improve held-out NSE; on the fixed harness all five scored below the unedited model. Method, results and how to rerun it: [`wsp/README.md`](wsp/README.md).
+
 ## Local Development
 
 ### Run Unit Tests
